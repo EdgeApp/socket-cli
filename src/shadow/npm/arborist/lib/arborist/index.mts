@@ -48,26 +48,61 @@ export const kRiskyReify = Symbol('riskyReify')
 
 export const Arborist: ArboristClass = UntypedArborist
 
+// Translate npm's `min-release-age` config (in days) into the `before` Date
+// option that pacote's pickManifest understands. npm's CLI normally performs
+// this translation, but the shadow Arborist intercepts resolution before that
+// happens, so we replicate it here. Without this, packages younger than
+// `min-release-age` days can slip through socket-wrapped installs.
+// See: https://github.com/npm/cli/pull/8825
+function applyMinReleaseAge<T extends Record<string, any> | undefined>(
+  opts: T,
+): T {
+  if (opts == null) {
+    return opts
+  }
+  const minAge = (opts as any)['min-release-age'] ?? (opts as any).minReleaseAge
+  if ((opts as any).before != null || minAge == null) {
+    return opts
+  }
+  const days = Number(minAge)
+  if (!Number.isFinite(days) || days <= 0) {
+    return opts
+  }
+  return {
+    ...(opts as any),
+    before: new Date(Date.now() - days * 86_400_000),
+  } as T
+}
+
 // Implementation code not related to our custom behavior is based on
 // https://github.com/npm/cli/blob/v11.0.0/workspaces/arborist/lib/arborist/index.js:
 export class SafeArborist extends Arborist {
   constructor(...ctorArgs: ConstructorParameters<ArboristClass>) {
+    const patchedCtorArgs = [
+      applyMinReleaseAge(ctorArgs.length ? ctorArgs[0] : undefined),
+      ...ctorArgs.slice(1),
+    ] as ConstructorParameters<ArboristClass>
     super(
       {
         path:
-          (ctorArgs.length ? ctorArgs[0]?.path : undefined) ?? process.cwd(),
-        ...(ctorArgs.length ? ctorArgs[0] : undefined),
+          (patchedCtorArgs.length
+            ? patchedCtorArgs[0]?.path
+            : undefined) ?? process.cwd(),
+        ...(patchedCtorArgs.length ? patchedCtorArgs[0] : undefined),
         ...SAFE_NO_SAVE_ARBORIST_REIFY_OPTIONS_OVERRIDES,
       },
-      ...ctorArgs.slice(1),
+      ...patchedCtorArgs.slice(1),
     )
-    ;(this as any)[kCtorArgs] = ctorArgs
+    ;(this as any)[kCtorArgs] = patchedCtorArgs
   }
 
   async [kRiskyReify](
     ...args: Parameters<InstanceType<ArboristClass>['reify']>
   ): Promise<NodeClass> {
     const ctorArgs = (this as any)[kCtorArgs]
+    const patchedReifyOpts = applyMinReleaseAge(
+      args.length ? args[0] : undefined,
+    )
     const arb = new Arborist(
       {
         ...(ctorArgs.length ? ctorArgs[0] : undefined),
@@ -77,7 +112,7 @@ export class SafeArborist extends Arborist {
     )
     const ret = await (arb.reify as (...args: any[]) => Promise<NodeClass>)(
       {
-        ...(args.length ? args[0] : undefined),
+        ...patchedReifyOpts,
         progress: false,
       },
       ...args.slice(1),
