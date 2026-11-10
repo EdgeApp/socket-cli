@@ -3,14 +3,18 @@ import { pluralize } from '@socketsecurity/registry/lib/words'
 
 import { applyFullExcludePaths } from './exclude-paths.mts'
 import { fetchSupportedScanFileNames } from './fetch-supported-scan-file-names.mts'
+import { finalizeTier1Scan } from './finalize-tier1-scan.mts'
 import { outputScanReach } from './output-scan-reach.mts'
 import { performReachabilityAnalysis } from './perform-reachability-analysis.mts'
+import { runDynamicSbomInference } from './run-dynamic-sbom-inference.mts'
 import constants from '../../constants.mts'
 import { checkCommandInput } from '../../utils/check-input.mts'
 import { findSocketYmlSync } from '../../utils/config.mts'
+import { withTmpDir } from '../../utils/fs.mts'
 import { getPackageFilesForScan } from '../../utils/path-resolve.mts'
 
 import type { ReachabilityOptions } from './perform-reachability-analysis.mts'
+import type { DynamicSbomInferenceResult } from './run-dynamic-sbom-inference.mts'
 import type { OutputKind } from '../../types.mts'
 
 export type HandleScanReachConfig = {
@@ -23,21 +27,47 @@ export type HandleScanReachConfig = {
   targets: string[]
 }
 
-export async function handleScanReach({
-  cwd,
-  interactive: _interactive,
-  orgSlug,
-  outputKind,
-  outputPath,
-  reachabilityOptions,
-  targets,
-}: HandleScanReachConfig) {
+async function runScanReach(
+  {
+    cwd,
+    interactive: _interactive,
+    orgSlug,
+    outputKind,
+    outputPath,
+    reachabilityOptions,
+    targets,
+  }: HandleScanReachConfig,
+  sbtTmpDir: string | undefined,
+) {
   const { spinner } = constants
 
+  // Extra discovery targets beyond the user's own; the reachability target
+  // itself stays `targets[0]`.
+  let scanTargets = targets
+  let dynamicResult: DynamicSbomInferenceResult | undefined
+
+  if (reachabilityOptions.dynamicSbomInference) {
+    logger.info('Generating Socket facts for each build root ...')
+    dynamicResult = await runDynamicSbomInference({
+      consumer: 'reach',
+      cwd,
+      excludePaths: reachabilityOptions.excludePaths,
+      purlTypes: reachabilityOptions.dynamicSbomInference,
+      sbtTmpDir,
+    })
+    scanTargets = Array.from(
+      new Set([...scanTargets, ...dynamicResult.factsPaths]),
+    )
+  }
+
   // Get supported file names.
-  const supportedFilesCResult = await fetchSupportedScanFileNames({ spinner })
+  const supportedFilesCResult = await fetchSupportedScanFileNames({
+    orgSlug,
+    spinner,
+  })
   if (!supportedFilesCResult.ok) {
     await outputScanReach(supportedFilesCResult, {
+      cwd,
       outputKind,
       outputPath,
     })
@@ -63,11 +93,15 @@ export async function handleScanReach({
       target: targets[0]!,
     })
 
-  const packagePaths = await getPackageFilesForScan(targets, supportedFiles, {
-    additionalIgnores: additionalScaIgnores,
-    config: socketConfig,
-    cwd,
-  })
+  const packagePaths = await getPackageFilesForScan(
+    scanTargets,
+    supportedFiles,
+    {
+      additionalIgnores: additionalScaIgnores,
+      config: socketConfig,
+      cwd,
+    },
+  )
 
   spinner.successAndStop(
     `Found ${packagePaths.length} ${pluralize('manifest file', packagePaths.length)} for reachability analysis.`,
@@ -92,16 +126,47 @@ export async function handleScanReach({
 
   const result = await performReachabilityAnalysis({
     cwd,
+    factsOnlyTypes: dynamicResult?.factsOnlyTypes,
     orgSlug,
+    outputKind,
     outputPath,
     packagePaths,
     reachabilityOptions: mergedReachabilityOptions,
+    resolvedPathsSidecar: dynamicResult?.resolvedPathsSidecar,
     spinner,
     target: targets[0]!,
-    uploadManifests: true,
   })
 
   spinner.stop()
 
-  await outputScanReach(result, { outputKind, outputPath })
+  // Standalone reachability has no full scan to bind to, but the full
+  // application reachability scan row still needs to transition to its DONE
+  // terminal state — otherwise it sits at the post-Coana intermediate state forever
+  // and looks indistinguishable from a stuck run. Pass `null` as the full
+  // scan id; the endpoint accepts it for this flow. Best-effort: never
+  // block the user-visible output on this.
+  const tier1Id = result.ok ? result.data?.tier1ReachabilityScanId : undefined
+  if (tier1Id) {
+    const finalizeResult = await finalizeTier1Scan(tier1Id, null)
+    if (!finalizeResult.ok) {
+      logger.warn(
+        `Failed to finalize full application reachability scan: ${finalizeResult.message}${finalizeResult.cause ? ` — ${finalizeResult.cause}` : ''}`,
+      )
+    }
+  }
+
+  await outputScanReach(result, { cwd, outputKind, outputPath })
+}
+
+export async function handleScanReach(
+  config: HandleScanReachConfig,
+): Promise<void> {
+  // sbt provisions its Scala toolchain under the directory passed as its
+  // isolated global base; the sidecar's artifactPaths point into it, so it
+  // must stay on disk until the reachability analysis has consumed them.
+  return config.reachabilityOptions.dynamicSbomInference
+    ? await withTmpDir('socket-dynamic-sbom-inference-', tmpDir =>
+        runScanReach(config, tmpDir),
+      )
+    : await runScanReach(config, undefined)
 }

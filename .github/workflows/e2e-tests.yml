@@ -16,13 +16,29 @@ jobs:
     strategy:
       fail-fast: true
       matrix:
-        node-version: [20, 22, 24]
+        # Node 20 reached end-of-life 2026-03-24; test supported majors only.
+        node-version: [22, 24]
         os: [ubuntu-latest]
         # os: [ubuntu-latest, windows-latest] - Windows tests disbaled (see project https://linear.app/socketdev/project/autofixes-windows-support-fc2f2a45f759)
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          persist-credentials: false
+      - name: Checkout source
+        shell: bash
+        env:
+          CHECKOUT_REF: ${{ github.sha }}
+          GITHUB_TOKEN: ${{ github.token }}
+          SERVER_URL: ${{ github.server_url }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          git init -q
+          git config --local advice.detachedHead false
+          git remote add origin "${SERVER_URL}/${REPOSITORY}"
+          AUTH_B64="$(printf 'x-access-token:%s' "$GITHUB_TOKEN" | base64 | tr -d '\n')"
+          export GIT_CONFIG_COUNT=1
+          export GIT_CONFIG_KEY_0="http.${SERVER_URL}/.extraheader"
+          export GIT_CONFIG_VALUE_0="AUTHORIZATION: basic ${AUTH_B64}"
+          git fetch --no-tags --depth=1 origin "$CHECKOUT_REF"
+          git checkout -q --detach FETCH_HEAD
 
       - name: Install pnpm
         shell: bash
@@ -61,9 +77,14 @@ jobs:
           fi
           echo "$PNPM_DIR" >> "${GITHUB_PATH:-/dev/null}"
 
-      - uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
-        with:
-          node-version: ${{ matrix.node-version }}
+      - name: Install Node.js
+        shell: bash
+        env:
+          NODE_VERSION: ${{ matrix.node-version }}
+        run: node scripts/ci/setup-node.mjs --version "$NODE_VERSION"
+
+      - name: Install uv
+        run: pnpm run ci:setup-uv
 
       - name: Download sfw-free
         shell: bash
@@ -74,16 +95,16 @@ jobs:
           # requires updating SFW_FREE_VERSION AND every platform's
           # SHA256 in the same commit, otherwise the download / verify
           # steps will diverge.
-          SFW_FREE_VERSION="1.7.2"
+          SFW_FREE_VERSION="1.15.0"
           SFW_DIR="${RUNNER_TEMP:-/tmp}/sfw-bin"
           KERNEL="$(uname -s | cut -d- -f1)"
           ARCH="$(uname -m)"
           case "${KERNEL}-${ARCH}" in
-            Linux-x86_64)                      ASSET="sfw-free-linux-x86_64"       ; SFW_BIN="$SFW_DIR/sfw"     ; EXPECTED_SHA256="93e2d9dfa244b82a74e014dc26b1c6af18b4adec20f35254378943db5fe91411" ;;
-            Linux-aarch64)                     ASSET="sfw-free-linux-arm64"         ; SFW_BIN="$SFW_DIR/sfw"     ; EXPECTED_SHA256="84a045e4e1bb320cc5c0d3929f02e53f199398b5be0637e8846d02d9ef0027b1" ;;
-            Darwin-x86_64)                     ASSET="sfw-free-macos-x86_64"       ; SFW_BIN="$SFW_DIR/sfw"     ; EXPECTED_SHA256="a5427d479d440f08e3789fa191ba57599be64997196daf42e67d964fec0382b4" ;;
-            Darwin-arm64)                      ASSET="sfw-free-macos-arm64"        ; SFW_BIN="$SFW_DIR/sfw"     ; EXPECTED_SHA256="248fb588e1e1a27e7192f7b079f739fc29a9de61f0bad7e90928363022dc5643" ;;
-            MINGW64_NT-x86_64|MSYS_NT-x86_64) ASSET="sfw-free-windows-x86_64.exe" ; SFW_BIN="$SFW_DIR/sfw.exe" ; EXPECTED_SHA256="6d333b4cac9d7c5712e2e99677ca634ac8a3020d550c6308312c60bea97f0a28" ;;
+            Linux-x86_64)                      ASSET="sfw-free-linux-x86_64"       ; SFW_BIN="$SFW_DIR/sfw"     ; EXPECTED_SHA256="c80371910a808ea5c68916c48e5451716a91ca411cf5e422fdbd8119729b742c" ;;
+            Linux-aarch64)                     ASSET="sfw-free-linux-arm64"         ; SFW_BIN="$SFW_DIR/sfw"     ; EXPECTED_SHA256="55671fa409ef3d40fcee66acbba4d7acfff8a5332d349ad47cca809ebf473cd0" ;;
+            Darwin-x86_64)                     ASSET="sfw-free-macos-x86_64"       ; SFW_BIN="$SFW_DIR/sfw"     ; EXPECTED_SHA256="07cfcc9805812130ebca07f73c51c2cd9c0181b394f25be4c969c0d31c9dc26f" ;;
+            Darwin-arm64)                      ASSET="sfw-free-macos-arm64"        ; SFW_BIN="$SFW_DIR/sfw"     ; EXPECTED_SHA256="fa473291b8b76220f4b636cf655e8a4dc03332145bdea3acfd9bc96887b2da20" ;;
+            MINGW64_NT-x86_64|MSYS_NT-x86_64) ASSET="sfw-free-windows-x86_64.exe" ; SFW_BIN="$SFW_DIR/sfw.exe" ; EXPECTED_SHA256="029882f10e1020c96353b184ec0dba7da853e0f6d35131ca930515a7e61e89e6" ;;
             *) echo "Unsupported platform: ${KERNEL}-${ARCH}" >&2; exit 1 ;;
           esac
           if [ ! -x "$SFW_BIN" ]; then
@@ -147,43 +168,10 @@ jobs:
       - name: Install dependencies
         run: pnpm install --loglevel error
 
-      - name: Install uv
-        run: curl -LsSf https://astral.sh/uv/install.sh | sh
-
       - name: Build
         run: pnpm run build
 
-      # TEMPORARY: probe the tier1-reachability-scan endpoint to capture the
-      # legacy_mode field returned by depscan for the API token's org. Only
-      # purpose is to diagnose why Coana v15 e2e tests halt as if the org were
-      # promoted out of legacy mode. Remove this step once the response has
-      # been captured in CI logs.
-      - name: Probe tier1 legacy_mode (DIAGNOSTIC - REMOVE AFTER USE)
-        if: matrix.node-version == 22
-        env:
-          SOCKET_CLI_API_TOKEN: ${{ secrets.SOCKET_API_TOKEN }} # zizmor: ignore[secrets-outside-env]
-        run: |
-          set -eu
-          auth=$(printf '%s:' "$SOCKET_CLI_API_TOKEN" | base64 -w0)
-          response=$(curl -sS -X PUT https://api.socket.dev/v0/tier1-reachability-scan \
-            -H "Authorization: Basic $auth" \
-            -H "Content-Type: application/json" \
-            -d '{"cli_options":null,"coana_cli_version":"15.1.0","socket_cli_version":"legacy-mode-probe","system_information":null}')
-          echo "Raw response:"
-          echo "$response"
-          echo "---"
-          echo "$response" | python3 -c "import json,sys
-          try:
-              d = json.load(sys.stdin)
-          except Exception as e:
-              print('response was not valid JSON:', e)
-              sys.exit(0)
-          print('response keys:', sorted(d.keys()))
-          print('legacy_mode present:', 'legacy_mode' in d)
-          print('legacy_mode value:', d.get('legacy_mode', '(absent)'))
-          print('scan_id present:', bool(d.get('tier1_reachability_scan_id')))"
-
       - name: Run e2e tests
         env:
-          SOCKET_CLI_API_TOKEN: ${{ secrets.SOCKET_API_TOKEN }} # zizmor: ignore[secrets-outside-env]
+          SOCKET_CLI_API_TOKEN: ${{ secrets.SOCKET_API_TOKEN_FOR_CLI_AND_SFW }} # zizmor: ignore[secrets-outside-env]
         run: pnpm run e2e-tests

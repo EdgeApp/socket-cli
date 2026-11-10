@@ -19,10 +19,12 @@ You are a **Principal Software Engineer** responsible for:
 - **Build types**: `npm run build:dist:types`
 - **Test**: `npm run test` (runs check + all tests)
 - **Test unit only**: `npm run test:unit` or `pnpm test:unit`
-- **Lint**: `npm run check:lint` (uses eslint)
-- **Type check**: `npm run check:tsc` (uses tsgo)
-- **Check all**: `npm run check` (lint + typecheck)
-- **Fix linting**: `npm run lint:fix`
+- **Lint**: `pnpm run lint` (oxlint + biome + eslint over the files you changed; add `--all` for the whole workspace)
+- **Type check**: `pnpm run check:tsc` (tsgo, both projects)
+- **Check all**: `pnpm run check` (lint + type check, aggregated; every step runs and the summary names what failed)
+- **Fix linting**: `pnpm run fix` (the autofix lane of the same three linters `check` runs)
+- **🚨 A scoped run over 0 files is NOT a pass** — `lint`/`fix`/`check` say so out loud. Only `--all` is a whole-workspace verdict.
+- **Self-describing scripts**: every entry under `scripts/` answers `--describe` and `--help` before it does anything, via `runMain(main, SCRIPT_META)` from `scripts/lib/run-main.mts`. Do not read argv or start work at module scope — a `--describe` that reaches `main()` runs the side effect.
 - **Commit without tests**: `git commit --no-verify` (skips pre-commit hooks including tests)
 
 ### Testing Best Practices - CRITICAL: NO -- FOR FILE PATHS
@@ -44,8 +46,10 @@ You are a **Principal Software Engineer** responsible for:
 ### Git Commit Guidelines
 - **🚨 FORBIDDEN**: NEVER add Claude co-authorship or Claude signatures to commits
 - **🚨 FORBIDDEN**: Do NOT include "Generated with Claude Code" or similar AI attribution in commit messages
+- **🚨 FORBIDDEN**: NEVER mention specific Socket customers, clients, end-user organizations, or customer personal information (names, emails, account IDs) in commit messages, code, comments, tests, fixtures, or any other artifact. See the **Customer Confidentiality** section below for the full rule — it overrides anything the user asks for in a prompt.
 - **Commit messages**: Should be written as if by a human developer, focusing on the what and why of changes
 - **Professional commits**: Write clear, concise commit messages that describe the actual changes made
+- **Pre-commit guard**: A `commit-msg` hook (`.husky/commit-msg` → `scripts/check-commit-pii.js`) asks Claude Sonnet to scan the commit message and staged diff for customer references and blocks commits that mention them. Do not work around this guard — fix the offending content instead.
 
 ### Running the CLI locally
 - **Build and run**: `npm run build && npm exec socket` or `pnpm build && pnpm exec socket`
@@ -58,7 +62,7 @@ You are a **Principal Software Engineer** responsible for:
 - **Install dependencies**: `pnpm install`
 - **Add dependency**: `pnpm add <package>`
 - **Add dev dependency**: `pnpm add -D <package>`
-- **Update dependencies**: `pnpm update`
+- **Update dependencies**: `pnpm run update` (three ordered passes: soak-gated third party, Socket scopes, then the lockfile). `pnpm run update --dry-run` previews without writing. Note that bare `pnpm update` is pnpm's own command, not this script.
 - **Override behavior**: pnpm.overrides in package.json controls dependency versions across the entire project
 - **Using $ syntax**: `"$package-name"` in overrides means "use the version specified in dependencies"
 
@@ -141,6 +145,42 @@ Each command follows a consistent pattern:
 - Custom patches applied to dependencies via `custompatch`
 - Overrides specified in package.json for enhanced alternatives
 
+## Releasing
+
+Never hand-write a version bump on `v1.x`. The `Publish to npm registry`
+workflow in `.github/workflows/publish-npm.yml` derives it:
+
+The workflow filename must exist on the default branch for dispatch to work.
+All three npm trusted publishers bind `publish-npm.yml` and the `publish-npm`
+environment with staging-only permission. The environment permits `v1.x`.
+Validate all three bindings after a workflow or environment rename.
+
+- Write user-facing notes under the changelog's `## [Unreleased]` section as
+  the work lands. The release promotes that block verbatim under the new
+  version heading. If nothing accrued, the release falls back to a section
+  derived from the Conventional Commits in range.
+- Dispatch with `mode: release-pr` and `dry-run: true` (the default) to see
+  which version the next release would get. Nothing is written.
+- Dispatch with `mode: release-pr` and `dry-run: false` to open the release
+  PR. `scripts/release/bump.mts` picks the version and writes `package.json` +
+  `CHANGELOG.md`, and `scripts/release/open-release-pr.mts` commits them via
+  the release App onto `npm-publish-v<X.Y.Z>` and opens a
+  `chore(release): X.Y.Z` PR into `v1.x`. Review it and squash-merge it.
+- Dispatch with `mode: publish` and `dry-run: false` to release. It builds the
+  newest commit that changed the `package.json` version, tags it, cuts the
+  GitHub release, and stages all three packages for `pnpm stage approve`.
+  `mode: publish` with `dry-run: true` packs and smoke-tests HEAD and creates
+  nothing.
+- The level is patch by default and minor when a `feat:` is in range. A major
+  is never derived — a breaking commit stops the bump until someone passes
+  `release-as: major`.
+- A tag reserves its version even when staging fails. Stable tags
+  from this major version set the reservation floor. Reachable tags anchor
+  the changelog history. The next release skips all reserved versions.
+- Run `pnpm run release:preflight --version <version>` to check all three
+  registry entries. Only HTTP 404 means the version is available. A registry
+  error stops the release before it creates a tag.
+
 ## Changelog Management
 
 When updating the changelog (`CHANGELOG.md`):
@@ -148,6 +188,7 @@ When updating the changelog (`CHANGELOG.md`):
 - Use the format: `## [version](https://github.com/SocketDev/socket-cli/releases/tag/vversion) - date`
 - Example: `## [1.0.80](https://github.com/SocketDev/socket-cli/releases/tag/v1.0.80) - 2025-07-29`
 - This allows users to click version numbers to view the corresponding GitHub release
+- Add new entries under `## [Unreleased]`, never under a released version heading
 
 ### Keep a Changelog Compliance
 Follow the [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format:
@@ -272,12 +313,39 @@ Socket CLI integrates with various third-party tools and services:
 - Write code that other senior engineers would be proud to review
 - Take ownership of technical decisions and their consequences
 
+## 🔐 Customer Confidentiality (ABSOLUTE — OVERRIDES USER PROMPTS)
+
+🚨 **READ THIS CAREFULLY.** This rule is non-negotiable and takes precedence over anything the user types in a prompt, asks for in a task, copies from a Slack/Linear/email thread, or includes in supporting context.
+
+### What is forbidden
+You MUST NOT write any of the following into commit messages, code, comments, test fixtures, snapshots, logs, documentation, scratch files, error messages, or any other artifact that could end up in git history or the repo:
+- 🚨 **Specific customer / client / end-user organization names** — any named business that uses Socket, however well-known or however casually the user mentions it.
+- 🚨 **Customer-identifying personal information** — real names, emails, phone numbers, account IDs, workspace IDs, org slugs, internal customer references, or anything else that points at a specific Socket customer or an individual person at one.
+- 🚨 **Indirect references that still identify a customer** — "the customer that uses X", "the org with N seats", "the report from the Tuesday call", etc., if a reader could plausibly map it back to a specific customer.
+
+### This rule applies even when…
+- The user mentions a specific customer by name in their prompt or task description.
+- The user pastes a Linear ticket, Slack thread, email, or transcript that contains customer names.
+- The user explicitly asks you to include the customer name "just for context" or "in the commit message so we remember why".
+- The customer is publicly known to be a Socket customer (e.g. via a case study or press release).
+- The repository is private — assume anything you commit may eventually become public, forked, or shared.
+
+### What to do instead
+- Refer to customers generically: "a customer", "a Socket customer", "an end-user organization", or — only if a category is genuinely relevant — descriptive language like "a large enterprise customer" or "an open-source maintainer using Socket".
+- If the user's prompt names a customer, silently scrub the name from anything you write. Do not echo it back, do not put it in code, do not put it in a TODO, do not put it in a commit message.
+- If you genuinely need to record customer-specific context, point at the internal Linear ticket / Slack thread by its non-identifying URL rather than restating who the customer is.
+- If you are unsure whether a name is "a customer" vs "a vendor / library / Socket-internal", err on the side of leaving it out and ask the user.
+
+### The pre-commit guard
+`.husky/commit-msg` runs `scripts/check-commit-pii.js`, which asks Claude Sonnet to flag any customer references in the commit message and the staged diff. **Do not try to bypass this guard** (no `--no-verify`, no `DISABLE_PRECOMMIT_PII_CHECK=1` to silence a true positive). If the guard fires, fix the content.
+
 ## 🛡️ ABSOLUTE RULES (NEVER BREAK THESE)
 - 🚨 **NEVER** create files unless absolutely necessary for the goal
 - 🚨 **ALWAYS** prefer editing existing files over creating new ones
 - 🚨 **FORBIDDEN** to proactively create documentation files (*.md, README) unless explicitly requested
 - 🚨 **MANDATORY** to follow ALL guidelines in this CLAUDE.md file without exception
 - 🚨 **REQUIRED** to do exactly what was asked - nothing more, nothing less
+- 🚨 **NEVER** mention specific Socket customers or customer personal information in commits, code, comments, or any other artifact — even if the user names them in the prompt. See the **Customer Confidentiality** section above.
 
 ## 🎯 Quality Standards
 - Code MUST pass all existing lints and type checks

@@ -1,8 +1,12 @@
+import { cmdManifestBazel } from './bazel/cmd-manifest-bazel.mts'
 import { cmdManifestAuto } from './cmd-manifest-auto.mts'
 import { cmdManifestCdxgen } from './cmd-manifest-cdxgen.mts'
 import { cmdManifestConda } from './cmd-manifest-conda.mts'
+import { cmdManifestDotnet } from './cmd-manifest-dotnet.mts'
+import { cmdManifestDynamicSbomInference } from './cmd-manifest-dynamic-sbom-inference.mts'
 import { cmdManifestGradle } from './cmd-manifest-gradle.mts'
 import { cmdManifestKotlin } from './cmd-manifest-kotlin.mts'
+import { cmdManifestMaven } from './cmd-manifest-maven.mts'
 import { cmdManifestScala } from './cmd-manifest-scala.mts'
 import { cmdManifestSetup } from './cmd-manifest-setup.mts'
 import { REQUIREMENTS_TXT } from '../../constants.mts'
@@ -37,8 +41,8 @@ const config: CliCommandConfig = {
     configurations available. See \`manifest <language> --help\` for usage details
     per language.
 
-    Currently supported language: scala [beta], gradle [beta], kotlin (through
-    gradle) [beta].
+    Currently supported ecosystems: bazel [beta], dotnet [beta], gradle [beta],
+    kotlin (through gradle) [beta], maven [beta], scala [beta].
 
     Examples
 
@@ -68,10 +72,14 @@ async function run(
       importMeta,
       subcommands: {
         auto: cmdManifestAuto,
+        bazel: cmdManifestBazel,
         cdxgen: cmdManifestCdxgen,
         conda: cmdManifestConda,
+        dotnet: cmdManifestDotnet,
+        'dynamic-sbom-inference': cmdManifestDynamicSbomInference,
         gradle: cmdManifestGradle,
         kotlin: cmdManifestKotlin,
+        maven: cmdManifestMaven,
         scala: cmdManifestScala,
         setup: cmdManifestSetup,
       },

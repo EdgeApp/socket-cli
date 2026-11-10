@@ -20,7 +20,9 @@
  */
 
 import { Agent as HttpsAgent, request as httpsRequest } from 'node:https'
+import { ReadableStream } from 'node:stream/web'
 
+import { HttpsProxyAgent } from 'hpagent'
 import { messageWithCauses } from 'pony-cause'
 
 import { debugDir, debugFn } from '@socketsecurity/registry/lib/debug'
@@ -39,42 +41,58 @@ import constants, {
   HTTP_STATUS_UNAUTHORIZED,
 } from '../constants.mts'
 import { getRequirements, getRequirementsKey } from './requirements.mts'
-import { getDefaultApiToken, getExtraCaCerts } from './sdk.mts'
+import {
+  getCliUserAgent,
+  getDefaultApiToken,
+  getDefaultProxyUrl,
+  getExtraCaCerts,
+} from './sdk.mts'
 
 import type { CResult } from '../types.mts'
 import type { Spinner } from '@socketsecurity/registry/lib/spinner'
-import type {
-  SocketSdkErrorResult,
-  SocketSdkOperations,
-  SocketSdkResult,
-  SocketSdkSuccessResult,
-} from '@socketsecurity/sdk'
 
 const MAX_REDIRECTS = 20
 const NO_ERROR_MESSAGE = 'No error message returned'
 
-// Cached HTTPS agent for extra CA certificate support in direct API calls.
+// Cached HTTPS agent for direct API calls. Undefined only until the first
+// getHttpsAgent() call lazily creates it.
 let _httpsAgent: HttpsAgent | undefined
-let _httpsAgentResolved = false
 
-// Returns an HTTPS agent configured with extra CA certificates when
-// SSL_CERT_FILE is set but NODE_EXTRA_CA_CERTS is not.
-function getHttpsAgent(): HttpsAgent | undefined {
-  if (_httpsAgentResolved) {
+// Returns an explicit HTTPS agent for direct API calls, routing through the
+// configured proxy when one is set and carrying extra CA certificates when
+// SSL_CERT_FILE is set but NODE_EXTRA_CA_CERTS is not. An explicit agent is
+// always returned. Node >=19's global agent enables keepAlive
+// with a 5s socket timeout that Node applies as a per-socket inactivity
+// timeout. A request made without an explicit agent inherits it and is torn
+// down after 5s of socket inactivity, prematurely dropping slow or idle-gapped
+// requests (e.g. streaming full-scan responses, large downloads) even when no
+// timeout was requested. A fresh Agent carries no timeout.
+function getHttpsAgent(): HttpsAgent {
+  if (_httpsAgent) {
     return _httpsAgent
   }
-  _httpsAgentResolved = true
   const ca = getExtraCaCerts()
-  if (!ca) {
-    return undefined
-  }
-  _httpsAgent = new HttpsAgent({ ca })
-  return _httpsAgent
+  const proxyUrl = getDefaultProxyUrl()
+  // `ca` covers the destination TLS handshake; `proxyRequestOptions.ca` covers
+  // the hop to an https:// proxy.
+  const agent = proxyUrl
+    ? new HttpsProxyAgent({
+        proxy: proxyUrl,
+        ...(ca ? { ca, proxyRequestOptions: { ca } } : {}),
+      })
+    : ca
+      ? new HttpsAgent({ ca })
+      : new HttpsAgent()
+  _httpsAgent = agent
+  return agent
 }
 
-// Wrapper around fetch that supports extra CA certificates via SSL_CERT_FILE.
-// Uses node:https.request with a custom agent when extra CA certs are needed,
-// falling back to regular fetch() otherwise. Follows redirects like fetch().
+// All outbound API requests use node:https.request rather than global fetch.
+// This ensures no body timeout is applied — large streaming ND-JSON responses
+// (e.g. full scan results) can transfer without a hard deadline. An explicit
+// HttpsAgent is always passed (carrying extra CA certificates when
+// SSL_CERT_FILE is configured) so requests do not inherit Node's global-agent
+// keepAlive socket timeout.
 export type ApiFetchInit = {
   body?: string | undefined
   headers?: Record<string, string> | undefined
@@ -149,29 +167,44 @@ function _httpsRequestFetch(
           )
           return
         }
-        const chunks: Buffer[] = []
-        res.on('data', (chunk: Buffer) => chunks.push(chunk))
-        res.on('end', () => {
-          const body = Buffer.concat(chunks)
-          const responseHeaders = new Headers()
-          for (const [key, value] of Object.entries(res.headers)) {
-            if (typeof value === 'string') {
-              responseHeaders.set(key, value)
-            } else if (Array.isArray(value)) {
-              for (const v of value) {
-                responseHeaders.append(key, v)
-              }
+        // Build response headers immediately on receipt.
+        const responseHeaders = new Headers()
+        for (const [key, value] of Object.entries(res.headers)) {
+          if (typeof value === 'string') {
+            responseHeaders.set(key, value)
+          } else if (Array.isArray(value)) {
+            for (const v of value) {
+              responseHeaders.append(key, v)
             }
           }
-          resolve(
-            new Response(body, {
-              status: statusCode ?? 0,
-              statusText: res.statusMessage ?? '',
-              headers: responseHeaders,
-            }),
-          )
+        }
+        // Resolve with a streaming body as soon as headers are available,
+        // matching fetch() semantics. Callers that pipe response.body (e.g.
+        // streamDownloadWithFetch) receive a live ReadableStream rather than
+        // a fully-buffered Buffer.
+        const body = new ReadableStream<Uint8Array>({
+          start(controller) {
+            res.on('data', (chunk: Buffer) => {
+              controller.enqueue(chunk)
+            })
+            res.on('end', () => {
+              controller.close()
+            })
+            res.on('error', (err: Error) => {
+              controller.error(err)
+            })
+          },
+          cancel() {
+            res.destroy()
+          },
         })
-        res.on('error', reject)
+        resolve(
+          new Response(body, {
+            status: statusCode ?? 0,
+            statusText: res.statusMessage ?? '',
+            headers: responseHeaders,
+          }),
+        )
       },
     )
     if (init.body) {
@@ -182,15 +215,31 @@ function _httpsRequestFetch(
   })
 }
 
+/**
+ * The cause for a failed request to `path`, with the explanation the Socket
+ * API gives in its `{ error: { message } }` body when there is one.
+ */
+async function describeApiFailure(
+  response: Response,
+  path: string,
+): Promise<string> {
+  let serverMessage: unknown
+  try {
+    serverMessage = (JSON.parse(await response.text()) as any)?.error?.message
+  } catch {
+    // A body that isn't JSON carries no message.
+  }
+  const reason = await getErrorMessageForHttpStatusCode(response.status)
+  return typeof serverMessage === 'string' && serverMessage
+    ? `${response.statusText}: ${serverMessage} (reason: ${reason}) (path: ${path})`
+    : `${response.statusText} (reason: ${reason}) (path: ${path})`
+}
+
 export async function apiFetch(
   url: string,
   init: ApiFetchInit = {},
 ): Promise<Response> {
-  const agent = getHttpsAgent()
-  if (!agent) {
-    return await fetch(url, init as globalThis.RequestInit)
-  }
-  return await _httpsRequestFetch(url, init, agent, 0)
+  return await _httpsRequestFetch(url, init, getHttpsAgent(), 0)
 }
 
 export type CommandRequirements = {
@@ -230,7 +279,7 @@ function logPermissionsFor403(cmdPath?: string | undefined): void {
 }
 
 // The Socket API server that should be used for operations.
-export function getDefaultApiBaseUrl(): string | undefined {
+export function getDefaultApiBaseUrl(): string {
   const baseUrl =
     constants.ENV.SOCKET_CLI_API_BASE_URL ||
     getConfigValueOrUndef(CONFIG_KEY_API_BASE_URL)
@@ -270,17 +319,58 @@ export type HandleApiCallOptions = {
   commandPath?: string | undefined
 }
 
-export type ApiCallResult<T extends SocketSdkOperations> = CResult<
-  SocketSdkSuccessResult<T>['data']
+/**
+ * The subset of a Socket SDK result that {@link handleApiCall} reads. Both the
+ * OpenAPI-derived `SocketSdkResult<T>` family and the SDK 4.x strict result
+ * types (`OrganizationsResult`, `RepositoryResult`, `DeleteResult`, ...)
+ * structurally satisfy this shape, so a caller can pass whichever result a
+ * given SDK method returns without forcing a (sometimes stale) operation-key
+ * shape onto the strict return types.
+ */
+export type SocketSdkReturnedResult =
+  | {
+      cause?: undefined
+      data: unknown
+      error?: undefined
+      status: number
+      success: true
+    }
+  | {
+      cause?: string | undefined
+      data?: undefined
+      error: string
+      status: number
+      success: false
+      url?: string | undefined
+    }
+
+/**
+ * The success `data` type carried by a Socket SDK result union `R`. The
+ * conditional distributes over `R`'s members, so only the success member(s)
+ * contribute their `data`; the error member resolves to `never` and drops out.
+ * Inferring the whole result `R` and extracting here (rather than inferring a
+ * bare `Data` from a `Promise<{ data: Data } | ...>`) avoids `Data` absorbing
+ * the error branch's `data?: undefined` — which would otherwise widen every
+ * result to `CResult<Data | undefined>`.
+ */
+export type ApiCallSuccessData<R> = R extends {
+  success: true
+  data: infer Data
+}
+  ? Data
+  : never
+
+export type ApiCallResult<R extends SocketSdkReturnedResult> = CResult<
+  ApiCallSuccessData<R>
 >
 
 /**
  * Handle Socket SDK API calls with error handling and permission logging.
  */
-export async function handleApiCall<T extends SocketSdkOperations>(
-  value: Promise<SocketSdkResult<T>>,
+export async function handleApiCall<R extends SocketSdkReturnedResult>(
+  value: Promise<R>,
   options?: HandleApiCallOptions | undefined,
-): Promise<ApiCallResult<T>> {
+): Promise<ApiCallResult<R>> {
   const {
     commandPath,
     description,
@@ -299,7 +389,7 @@ export async function handleApiCall<T extends SocketSdkOperations>(
     }
   }
 
-  let sdkResult: SocketSdkResult<T>
+  let sdkResult: R
   try {
     sdkResult = await value
     if (!silence) {
@@ -318,7 +408,7 @@ export async function handleApiCall<T extends SocketSdkOperations>(
     }
   } catch (e) {
     spinner?.stop()
-    const socketSdkErrorResult: ApiCallResult<T> = {
+    const socketSdkErrorResult: ApiCallResult<R> = {
       ok: false,
       message: 'Socket API error',
       cause: messageWithCauses(e as Error),
@@ -331,22 +421,22 @@ export async function handleApiCall<T extends SocketSdkOperations>(
     return socketSdkErrorResult
   }
 
-  // Note: TS can't narrow down the type of result due to generics.
+  // The `success` discriminant is a concrete boolean literal in both branches,
+  // so this narrows the result to its error branch regardless of `R`.
   if (sdkResult.success === false) {
     const endpoint = description || 'Socket API'
-    debugApiResponse('API', endpoint, sdkResult.status as number)
+    debugApiResponse('API', endpoint, sdkResult.status)
     debugDir('inspect', { sdkResult })
 
-    const errCResult = sdkResult as SocketSdkErrorResult<T>
-    const errStr = errCResult.error ? String(errCResult.error).trim() : ''
+    const errStr = sdkResult.error ? String(sdkResult.error).trim() : ''
     const message = errStr || NO_ERROR_MESSAGE
-    const reason = errCResult.cause || NO_ERROR_MESSAGE
+    const reason = sdkResult.cause || NO_ERROR_MESSAGE
     const baseCause =
       reason && message !== reason ? `${message} (reason: ${reason})` : message
-    const cause = errCResult.url
-      ? `${baseCause} (url: ${errCResult.url})`
+    const cause = sdkResult.url
+      ? `${baseCause} (url: ${sdkResult.url})`
       : baseCause
-    const socketSdkErrorResult: ApiCallResult<T> = {
+    const socketSdkErrorResult: ApiCallResult<R> = {
       ok: false,
       message: 'Socket API error',
       cause,
@@ -362,18 +452,21 @@ export async function handleApiCall<T extends SocketSdkOperations>(
 
     return socketSdkErrorResult
   }
-  const socketSdkSuccessResult: ApiCallResult<T> = {
+  // Narrowing a type parameter by its `success` discriminant resolves `.data`
+  // through the constraint's success branch (`unknown`); re-apply the precise
+  // per-call success type the return contract already guarantees.
+  const socketSdkSuccessResult: ApiCallResult<R> = {
     ok: true,
-    data: (sdkResult as SocketSdkSuccessResult<T>).data,
+    data: sdkResult.data as ApiCallSuccessData<R>,
   }
   return socketSdkSuccessResult
 }
 
-export async function handleApiCallNoSpinner<T extends SocketSdkOperations>(
-  value: Promise<SocketSdkResult<T>>,
+export async function handleApiCallNoSpinner<R extends SocketSdkReturnedResult>(
+  value: Promise<R>,
   description: string,
-): Promise<CResult<SocketSdkSuccessResult<T>['data']>> {
-  let sdkResult: SocketSdkResult<T>
+): Promise<ApiCallResult<R>> {
+  let sdkResult: R
   try {
     sdkResult = await value
   } catch (e) {
@@ -392,21 +485,19 @@ export async function handleApiCallNoSpinner<T extends SocketSdkOperations>(
     }
   }
 
-  // Note: TS can't narrow down the type of result due to generics
+  // The `success` discriminant is a concrete boolean literal in both branches,
+  // so this narrows the result to its error branch regardless of `R`.
   if (sdkResult.success === false) {
     debugFn('error', `fail: ${description} bad response`)
     debugDir('inspect', { sdkResult })
 
-    const sdkErrorResult = sdkResult as SocketSdkErrorResult<T>
-    const errStr = sdkErrorResult.error
-      ? String(sdkErrorResult.error).trim()
-      : ''
+    const errStr = sdkResult.error ? String(sdkResult.error).trim() : ''
     const message = errStr || NO_ERROR_MESSAGE
-    const reason = sdkErrorResult.cause || NO_ERROR_MESSAGE
+    const reason = sdkResult.cause || NO_ERROR_MESSAGE
     const baseCause =
       reason && message !== reason ? `${message} (reason: ${reason})` : message
-    const cause = sdkErrorResult.url
-      ? `${baseCause} (url: ${sdkErrorResult.url})`
+    const cause = sdkResult.url
+      ? `${baseCause} (url: ${sdkResult.url})`
       : baseCause
 
     return {
@@ -418,38 +509,45 @@ export async function handleApiCallNoSpinner<T extends SocketSdkOperations>(
       },
     }
   } else {
-    const sdkSuccessResult = sdkResult as SocketSdkSuccessResult<T>
+    // Narrowing a type parameter by its `success` discriminant resolves `.data`
+    // through the constraint's success branch (`unknown`); re-apply the precise
+    // per-call success type the return contract already guarantees.
     return {
       ok: true,
-      data: sdkSuccessResult.data,
+      data: sdkResult.data as ApiCallSuccessData<R>,
     }
   }
 }
 
 async function queryApi(path: string, apiToken: string) {
   const baseUrl = getDefaultApiBaseUrl()
-  if (!baseUrl) {
-    throw new Error('Socket API base URL is not configured.')
-  }
-
   const url = `${baseUrl}${baseUrl.endsWith('/') ? '' : '/'}${path}`
   const result = await apiFetch(url, {
     method: 'GET',
     headers: {
       Authorization: `Basic ${btoa(`${apiToken}:`)}`,
+      'User-Agent': getCliUserAgent(),
     },
   })
   return result
 }
 
+export type ApiTextResult = {
+  status: number
+  text: string
+}
+
 /**
- * Query Socket API endpoint and return text response with error handling.
+ * Query a Socket API endpoint and return the HTTP status alongside the text
+ * body, with error handling. Unlike queryApiSafeText this surfaces the status
+ * on success (including 2xx statuses like 202 Accepted), so callers can drive
+ * status-dependent flows such as the cached-scan 202 poll loop.
  */
-export async function queryApiSafeText(
+export async function queryApiSafeTextWithStatus(
   path: string,
   description?: string | undefined,
   commandPath?: string | undefined,
-): Promise<CResult<string>> {
+): Promise<CResult<ApiTextResult>> {
   const apiToken = getDefaultApiToken()
   if (!apiToken) {
     return {
@@ -519,7 +617,7 @@ export async function queryApiSafeText(
     return {
       ok: false,
       message: 'Socket API error',
-      cause: `${result.statusText} (reason: ${await getErrorMessageForHttpStatusCode(status)}) (path: ${path})`,
+      cause: await describeApiFailure(result, path),
       data: {
         code: status,
       },
@@ -527,10 +625,13 @@ export async function queryApiSafeText(
   }
 
   try {
-    const data = await result.text()
+    const text = await result.text()
     return {
       ok: true,
-      data,
+      data: {
+        status: result.status,
+        text,
+      },
     }
   } catch (e) {
     debugFn('error', 'Failed to read API response text')
@@ -542,6 +643,22 @@ export async function queryApiSafeText(
       cause: `Unexpected error reading response text (path: ${path})`,
     }
   }
+}
+
+/**
+ * Query Socket API endpoint and return text response with error handling.
+ */
+export async function queryApiSafeText(
+  path: string,
+  description?: string | undefined,
+  commandPath?: string | undefined,
+): Promise<CResult<string>> {
+  const result = await queryApiSafeTextWithStatus(
+    path,
+    description,
+    commandPath,
+  )
+  return result.ok ? { ok: true, data: result.data.text } : result
 }
 
 /**
@@ -596,14 +713,6 @@ export async function sendApiRequest<T>(
   }
 
   const baseUrl = getDefaultApiBaseUrl()
-  if (!baseUrl) {
-    return {
-      ok: false,
-      message: 'Configuration Error',
-      cause:
-        'Socket API endpoint is not configured. Please check your environment configuration.',
-    }
-  }
 
   const { body, commandPath, description, method } = {
     __proto__: null,
@@ -622,6 +731,7 @@ export async function sendApiRequest<T>(
       headers: {
         Authorization: `Basic ${btoa(`${apiToken}:`)}`,
         'Content-Type': 'application/json',
+        'User-Agent': getCliUserAgent(),
       },
       ...(body ? { body: JSON.stringify(body) } : {}),
     }
@@ -667,7 +777,7 @@ export async function sendApiRequest<T>(
     return {
       ok: false,
       message: 'Socket API error',
-      cause: `${result.statusText} (reason: ${await getErrorMessageForHttpStatusCode(status)}) (path: ${path})`,
+      cause: await describeApiFailure(result, path),
       data: {
         code: status,
       },

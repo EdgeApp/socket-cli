@@ -6,36 +6,8 @@ import {
   excludePathToScanIgnores,
   projectIgnorePathsToReachExcludePaths,
 } from './exclude-paths.mts'
+import { makeReachabilityOptions } from '../../../test/reachability-options.mts'
 import { InputError } from '../../utils/errors.mts'
-
-import type { ReachabilityOptions } from './perform-reachability-analysis.mts'
-
-function makeReachOptions(
-  overrides: Partial<ReachabilityOptions> = {},
-): ReachabilityOptions {
-  return {
-    excludePaths: [],
-    reachAnalysisMemoryLimit: 8192,
-    reachAnalysisTimeout: 0,
-    reachConcurrency: 1,
-    reachContinueOnAnalysisErrors: false,
-    reachContinueOnInstallErrors: false,
-    reachContinueOnMissingLockFiles: false,
-    reachContinueOnNoSourceFiles: false,
-    reachDebug: false,
-    reachDetailedAnalysisLogFile: false,
-    reachDisableAnalytics: false,
-    reachDisableExternalToolChecks: false,
-    reachEcosystems: [],
-    reachEnableAnalysisSplitting: false,
-    reachExcludePaths: [],
-    reachLazyMode: false,
-    reachSkipCache: false,
-    reachUseOnlyPregeneratedSboms: false,
-    reachVersion: undefined,
-    ...overrides,
-  }
-}
 
 describe('exclude-paths', () => {
   describe('assertValidExcludePaths', () => {
@@ -76,6 +48,31 @@ describe('exclude-paths', () => {
         )
       },
     )
+
+    it.each([
+      'src/[abc',
+      'foo{bar',
+      'a/{b/{c}}',
+      'x}y{z',
+      'src/[]]x',
+      'src/[!]x',
+    ])('rejects NIO-glob-incompatible bracket pattern %j', input => {
+      expect(() => assertValidExcludePaths([input])).toThrow(
+        /unbalanced or nested/,
+      )
+    })
+
+    it.each([
+      'src/[abc]',
+      'src/[!abc]',
+      'src/[^abc]',
+      'src/[a]b]',
+      'src/[[]',
+      'a/{b}/c',
+      'x}y',
+    ])('allows balanced bracket pattern %j', input => {
+      expect(() => assertValidExcludePaths([input])).not.toThrow()
+    })
   })
 
   describe('excludePathToScanIgnores', () => {
@@ -179,9 +176,10 @@ describe('exclude-paths', () => {
     it('expands exclude-paths into SCA ignores and re-anchored Coana excludes', () => {
       const result = applyFullExcludePaths({
         cwd: '/repo',
-        reachabilityOptions: makeReachOptions({
+        reachabilityOptions: {
+          ...makeReachabilityOptions(),
           excludePaths: ['tests'],
-        }),
+        },
         target: '/repo',
       })
 

@@ -22,7 +22,10 @@
  * - Ensures type safety for ecosystem operations
  */
 
+import { arrayUnique, joinAnd } from '@socketsecurity/registry/lib/arrays'
+
 import { NPM } from '../constants.mts'
+import { InputError } from './errors.mts'
 
 import type { EcosystemString } from '@socketsecurity/registry'
 import type { components } from '@socketsecurity/sdk/types/api'
@@ -47,6 +50,7 @@ export const ALL_ECOSYSTEMS = [
   'bitbucket',
   'cargo',
   'chrome',
+  'clawhub',
   'cocoapods',
   'composer',
   'conan',
@@ -70,6 +74,7 @@ export const ALL_ECOSYSTEMS = [
   'pypi',
   'qpkg',
   'rpm',
+  'socket',
   'swift',
   'swid',
   'unknown',
@@ -87,8 +92,27 @@ export type _Check_ALL_ECOSYSTEMS_has_no_extras =
 
 export const ALL_SUPPORTED_ECOSYSTEMS = new Set<string>(ALL_ECOSYSTEMS)
 
+// Purl types accepted by Coana's reachability `--purl-types` gate
+// (@coana-tech/cli `getAdvisoryEcosystemFromPurlType`), narrower than
+// ALL_ECOSYSTEMS. Values outside this set are rejected by the engine at scan
+// time, so we validate up front. Keep in sync when bumping @coana-tech/cli.
+export const REACHABILITY_SUPPORTED_ECOSYSTEMS = [
+  'cargo',
+  'composer',
+  'gem',
+  'golang',
+  'maven',
+  NPM,
+  'nuget',
+  'pypi',
+] as const satisfies readonly PURL_Type[]
+
 export function getEcosystemChoicesForMeow(): string[] {
   return [...ALL_ECOSYSTEMS]
+}
+
+export function getReachabilityEcosystemChoices(): string[] {
+  return [...REACHABILITY_SUPPORTED_ECOSYSTEMS]
 }
 
 export function isValidEcosystem(value: string): value is PURL_Type {
@@ -107,4 +131,23 @@ export function parseEcosystems(
       : value.map(v => String(v).toLowerCase())
 
   return values.filter(isValidEcosystem)
+}
+
+export function parseEcosystemChoices(
+  raw: readonly string[],
+  choices: readonly string[],
+): PURL_Type[] {
+  const ecosystems = arrayUnique(raw.map(e => e.toLowerCase()))
+  for (const ecosystem of ecosystems) {
+    if (!choices.includes(ecosystem)) {
+      throw new InputError(
+        `Invalid ecosystem: "${ecosystem}". Valid values are: ${joinAnd(choices)}`,
+      )
+    }
+  }
+  return ecosystems as PURL_Type[]
+}
+
+export function parseReachEcosystems(raw: readonly string[]): PURL_Type[] {
+  return parseEcosystemChoices(raw, getReachabilityEcosystemChoices())
 }

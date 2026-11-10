@@ -25,7 +25,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import constants from '../constants.mts'
-import { getExtraCaCerts, setupSdk } from './sdk.mts'
+import {
+  clampApiTimeout,
+  getCliUserAgent,
+  getExtraCaCerts,
+  setupSdk,
+} from './sdk.mts'
 
 import type { RequestInfo, ResponseInfo } from '@socketsecurity/sdk'
 
@@ -453,6 +458,24 @@ describe('SDK setup with telemetry hooks', () => {
         expect(result.data.options.userAgent).toBe('socket-cli/1.1.34')
       }
     })
+
+    it('should pass an explicit agent with no idle timeout by default', async () => {
+      // Regression: Node >=19's global agent applies a 5s socket inactivity
+      // timeout. Requests made without an explicit agent inherit it, so
+      // uploadManifestFiles (which streams a chunked multipart body while the
+      // server parses auth/multipart before responding) was torn down at ~5s
+      // with no response. setupSdk must always supply an explicit agent that
+      // has no such timeout.
+      const result = await setupSdk({ apiToken: 'test-token' })
+
+      expect(result.ok).toBe(true)
+      if (result.ok) {
+        expect(result.data.options.agent).toBeDefined()
+        expect(MockHttpsAgent).toHaveBeenCalled()
+        const agentOpts = MockHttpsAgent.mock.calls.at(-1)?.[0]
+        expect(agentOpts?.timeout).toBeUndefined()
+      }
+    })
   })
 
   describe('hook integration', () => {
@@ -554,6 +577,23 @@ describe('SDK setup with telemetry hooks', () => {
         )
       }
     })
+  })
+})
+
+describe('getCliUserAgent', () => {
+  it('formats name/version, node version, and platform/arch', () => {
+    const userAgent = getCliUserAgent()
+
+    expect(userAgent).toBe(
+      `socket-cli/1.1.34 node/${process.version} ${process.platform}/${process.arch}`,
+    )
+  })
+
+  it('returns a stable value across repeated calls', () => {
+    const first = getCliUserAgent()
+    const second = getCliUserAgent()
+
+    expect(second).toBe(first)
   })
 })
 
@@ -703,14 +743,37 @@ describe('setupSdk with extra CA certificates', () => {
     }
   })
 
-  it('should not create agent when no extra CA certs are needed', async () => {
+  it('should create a default HttpsAgent with no timeout when no proxy or CA certs are configured', async () => {
     const { setupSdk: fn } = await import('./sdk.mts')
     const result = await fn({ apiToken: 'test-token' })
 
     expect(result.ok).toBe(true)
     if (result.ok) {
-      expect(result.data.options.agent).toBeUndefined()
-      expect(MockHttpsAgent).not.toHaveBeenCalled()
+      // The default branch must still pass an explicit agent so requests do
+      // not inherit Node's global agent (keepAlive plus a 5s socket timeout).
+      expect(result.data.options.agent).toBeDefined()
+      expect(MockHttpsAgent).toHaveBeenCalledTimes(1)
+      // A fresh agent carries no timeout, so no per-socket inactivity timeout.
+      const agentOpts = MockHttpsAgent.mock.calls[0]?.[0]
+      expect(agentOpts?.timeout).toBeUndefined()
     }
+  })
+})
+
+describe('clampApiTimeout', () => {
+  it('should leave an in-range timeout unchanged', () => {
+    expect(clampApiTimeout(5_000)).toBe(5_000)
+    expect(clampApiTimeout(60_000)).toBe(60_000)
+    expect(clampApiTimeout(300_000)).toBe(300_000)
+  })
+
+  it('should raise a below-minimum timeout to the floor', () => {
+    expect(clampApiTimeout(1_000)).toBe(5_000)
+    expect(clampApiTimeout(1)).toBe(5_000)
+  })
+
+  it('should lower an above-maximum timeout to the ceiling', () => {
+    expect(clampApiTimeout(999_999)).toBe(300_000)
+    expect(clampApiTimeout(300_001)).toBe(300_000)
   })
 })

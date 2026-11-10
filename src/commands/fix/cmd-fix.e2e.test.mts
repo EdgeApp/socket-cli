@@ -27,6 +27,12 @@ function getTestEnv(apiToken: string): Record<string, string | undefined> {
     http_proxy: undefined,
     https_proxy: undefined,
     SOCKET_CLI_API_PROXY: undefined,
+    // A firewall proxy (e.g. sfw in CI) also points these at its own CA, which
+    // then becomes the only trusted root for direct connections.
+    GIT_SSL_CAINFO: undefined,
+    PIP_CERT: undefined,
+    SSL_CERT_DIR: undefined,
+    SSL_CERT_FILE: undefined,
   }
 }
 
@@ -196,9 +202,9 @@ describe('socket fix (E2E tests)', async () => {
             `\nSuccessfully upgraded lodash from ${beforeVersion} to ${afterVersion}`,
           )
         } catch (e) {
-          if (code !== 0) {
-            logCommandOutput(code, stdout, stderr)
-          }
+          // Log output on any failure — including exit-0 runs whose later
+          // assertions fail (e.g. a silent no-op upgrade).
+          logCommandOutput(code, stdout, stderr)
           throw e
         } finally {
           await tempFixture.cleanup()
@@ -276,9 +282,9 @@ describe('socket fix (E2E tests)', async () => {
             `\nSuccessfully upgraded lodash from ${beforeVersion} to ${afterVersion} and wrote output file`,
           )
         } catch (e) {
-          if (code !== 0) {
-            logCommandOutput(code, stdout, stderr)
-          }
+          // Log output on any failure — including exit-0 runs whose later
+          // assertions fail (e.g. a silent no-op upgrade).
+          logCommandOutput(code, stdout, stderr)
           throw e
         } finally {
           await tempFixture.cleanup()
@@ -334,9 +340,9 @@ describe('socket fix (E2E tests)', async () => {
             `\nSuccessfully fixed GHSA-35jh-r3h4-6jhm by upgrading lodash from ${beforeVersion} to ${afterVersion}`,
           )
         } catch (e) {
-          if (code !== 0) {
-            logCommandOutput(code, stdout, stderr)
-          }
+          // Log output on any failure — including exit-0 runs whose later
+          // assertions fail (e.g. a silent no-op upgrade).
+          logCommandOutput(code, stdout, stderr)
           throw e
         } finally {
           await tempFixture.cleanup()
@@ -392,9 +398,9 @@ describe('socket fix (E2E tests)', async () => {
             `\nSuccessfully converted CVE-2021-23337 to GHSA and fixed by upgrading lodash from ${beforeVersion} to ${afterVersion}`,
           )
         } catch (e) {
-          if (code !== 0) {
-            logCommandOutput(code, stdout, stderr)
-          }
+          // Log output on any failure — including exit-0 runs whose later
+          // assertions fail (e.g. a silent no-op upgrade).
+          logCommandOutput(code, stdout, stderr)
           throw e
         } finally {
           await tempFixture.cleanup()
@@ -458,9 +464,9 @@ describe('socket fix (E2E tests)', async () => {
             '\nSuccessfully verified --silence --json outputs only JSON',
           )
         } catch (e) {
-          if (code !== 0) {
-            logCommandOutput(code, stdout, stderr)
-          }
+          // Log output on any failure — including exit-0 runs whose later
+          // assertions fail (e.g. a silent no-op upgrade).
+          logCommandOutput(code, stdout, stderr)
           throw e
         } finally {
           await tempFixture.cleanup()
@@ -525,9 +531,9 @@ describe('socket fix (E2E tests)', async () => {
             `\n--package-managers NPM upgraded npm-app lodash to ${afterLodash} and left pnpm-app axios untouched`,
           )
         } catch (e) {
-          if (code !== 0) {
-            logCommandOutput(code, stdout, stderr)
-          }
+          // Log output on any failure — including exit-0 runs whose later
+          // assertions fail (e.g. a silent no-op upgrade).
+          logCommandOutput(code, stdout, stderr)
           throw e
         } finally {
           await tempFixture.cleanup()
@@ -590,9 +596,9 @@ describe('socket fix (E2E tests)', async () => {
             `\n--package-managers PNPM upgraded pnpm-app axios to ${afterAxios} and left npm-app lodash untouched`,
           )
         } catch (e) {
-          if (code !== 0) {
-            logCommandOutput(code, stdout, stderr)
-          }
+          // Log output on any failure — including exit-0 runs whose later
+          // assertions fail (e.g. a silent no-op upgrade).
+          logCommandOutput(code, stdout, stderr)
           throw e
         } finally {
           await tempFixture.cleanup()
@@ -692,9 +698,9 @@ describe('socket fix (E2E tests)', async () => {
             `\nSuccessfully upgraded django from ${beforeVersion} to ${afterVersion}`,
           )
         } catch (e) {
-          if (code !== 0) {
-            logCommandOutput(code, stdout, stderr)
-          }
+          // Log output on any failure — including exit-0 runs whose later
+          // assertions fail (e.g. a silent no-op upgrade).
+          logCommandOutput(code, stdout, stderr)
           throw e
         } finally {
           await tempFixture.cleanup()

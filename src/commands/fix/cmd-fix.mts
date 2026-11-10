@@ -12,13 +12,17 @@ import { logger } from '@socketsecurity/registry/lib/logger'
 
 import { handleFix } from './handle-fix.mts'
 import constants, {
+  COANA_CLI_VERSION,
   ERROR_UNABLE_RESOLVE_ORG,
   FLAG_ID,
 } from '../../constants.mts'
 import { commonFlags, outputFlags } from '../../flags.mts'
 import { checkCommandInput } from '../../utils/check-input.mts'
 import { cmdFlagValueToArray } from '../../utils/cmd.mts'
-import { getEcosystemChoicesForMeow } from '../../utils/ecosystem.mts'
+import {
+  getEcosystemChoicesForMeow,
+  parseEcosystemChoices,
+} from '../../utils/ecosystem.mts'
 import { getOutputKind } from '../../utils/get-output-kind.mts'
 import { meowOrExit } from '../../utils/meow-with-subcommands.mts'
 import {
@@ -31,9 +35,14 @@ import {
 } from '../../utils/package-manager.mts'
 import { RangeStyles } from '../../utils/semver.mts'
 import { getDefaultOrgSlug } from '../ci/fetch-default-org-slug.mts'
+import { assertValidExcludePaths } from '../scan/exclude-paths.mts'
+import {
+  DYNAMIC_SBOM_INFERENCE_DESCRIPTION,
+  dynamicSbomInferenceEcosystemsFlags,
+  parseDynamicSbomInferenceFlags,
+} from '../scan/reachability-flags.mts'
 
 import type { MeowFlag, MeowFlags } from '../../flags.mts'
-import type { PURL_Type } from '../../utils/ecosystem.mts'
 import type {
   CliCommandConfig,
   CliCommandContext,
@@ -55,6 +64,12 @@ export const cmdFix = {
 }
 
 const generalFlags: MeowFlags = {
+  allowOverrides: {
+    type: 'boolean',
+    default: false,
+    description:
+      "When the only fix for a vulnerability is blocked by a parent package's declared version range, write an override or resolution that forces the fixed version under that parent. This can install a version outside the range the parent declares, so test the parent afterwards. Works for npm, pnpm, Yarn and Rush projects.",
+  },
   autopilot: {
     type: 'boolean',
     default: false,
@@ -65,7 +80,7 @@ const generalFlags: MeowFlags = {
   },
   fixVersion: {
     type: 'string',
-    description: `Override the version of @coana-tech/cli used for fix analysis. Default: ${constants.ENV.INLINED_SOCKET_CLI_COANA_TECH_CLI_VERSION}.`,
+    description: `Override the version of @coana-tech/cli used for fix analysis. Default: ${COANA_CLI_VERSION}.`,
   },
   applyFixes: {
     aliases: ['onlyCompute'],
@@ -81,6 +96,18 @@ const generalFlags: MeowFlags = {
     default: [],
     description:
       'Exclude workspaces matching these glob patterns. Can be provided as comma separated values or as multiple flags',
+    isMultiple: true,
+    // Hidden in favor of --exclude-paths, which covers both manifest
+    // discovery and workspace filtering. --exclude is preserved for
+    // backwards compatibility with the narrower (fix-application only)
+    // semantic.
+    hidden: true,
+  },
+  excludePaths: {
+    type: 'string',
+    default: [],
+    description:
+      'Skip matching paths from the scan entirely: manifests under these paths are not uploaded, and fixes are not applied to workspaces under them. Patterns are anchored micromatch globs matched relative to the target directory (CWD); `data/postgres/pgdata` matches that exact path, `**/pgdata` matches at any depth. Use this to skip directories the current user cannot read so they do not abort manifest collection. Negation patterns (`!path`) are not supported. Accepts a comma-separated value or multiple flags.',
     isMultiple: true,
     hidden: false,
   },
@@ -164,6 +191,12 @@ Available styles:
     default: false,
     description: 'Disable external tool checks during fix analysis.',
   },
+  dynamicSbomInference: {
+    type: 'boolean',
+    default: false,
+    description: `${DYNAMIC_SBOM_INFERENCE_DESCRIPTION} Fixes are then attributed to the projects/modules that actually resolve each vulnerable dependency. The generated files are removed afterwards.`,
+  },
+  ...dynamicSbomInferenceEcosystemsFlags,
   ecosystems: {
     type: 'string',
     default: [],
@@ -308,12 +341,14 @@ async function run(
 
   const {
     all,
+    allowOverrides,
     applyFixes,
     autopilot,
     debug,
     disableExternalToolChecks,
     ecosystems,
     exclude,
+    excludePaths,
     fixVersion,
     include,
     json,
@@ -333,12 +368,14 @@ async function run(
     unknownFlags = [],
   } = cli.flags as {
     all: boolean
+    allowOverrides: boolean
     applyFixes: boolean
     autopilot: boolean
     debug: boolean
     disableExternalToolChecks: boolean
     ecosystems: string[]
     exclude: string[]
+    excludePaths: string[]
     fixVersion: string | undefined
     include: string[]
     json: boolean
@@ -366,26 +403,13 @@ async function run(
 
   const outputKind = getOutputKind(json, markdown)
 
-  // Process comma-separated values for ecosystems flag.
-  // ALL_ECOSYSTEMS is lowercase, so normalize input for a case-insensitive
-  // match (mirrors --package-managers behavior).
-  const ecosystemsRaw = cmdFlagValueToArray(ecosystems).map(s =>
-    s.toLowerCase(),
-  )
+  const dynamicSbomInference = parseDynamicSbomInferenceFlags(cli.flags)
 
   // Validate ecosystem values early, before dry-run check.
-  const validatedEcosystems: PURL_Type[] = []
-  const validEcosystemChoices = getEcosystemChoicesForMeow()
-  for (const ecosystem of ecosystemsRaw) {
-    if (!validEcosystemChoices.includes(ecosystem)) {
-      logger.fail(
-        `Invalid ecosystem: "${ecosystem}". Valid values are: ${joinAnd(validEcosystemChoices)}`,
-      )
-      process.exitCode = 1
-      return
-    }
-    validatedEcosystems.push(ecosystem as PURL_Type)
-  }
+  const validatedEcosystems = parseEcosystemChoices(
+    cmdFlagValueToArray(ecosystems),
+    getEcosystemChoicesForMeow(),
+  )
 
   // Process and validate package manager values early, before dry-run check.
   // Coana normalizes input to uppercase and rejects unknown values, so do the
@@ -464,6 +488,19 @@ async function run(
     return
   }
 
+  const includePatterns = cmdFlagValueToArray(include)
+  const excludePatterns = cmdFlagValueToArray(exclude)
+  const excludePathsPatterns = cmdFlagValueToArray(excludePaths)
+  // Validate before the network round-trip so a bad pattern doesn't waste
+  // an org-slug API call.
+  try {
+    assertValidExcludePaths(excludePathsPatterns)
+  } catch (e) {
+    logger.fail((e as Error).message)
+    process.exitCode = 1
+    return
+  }
+
   if (dryRun) {
     logger.log(constants.DRY_RUN_NOT_SAVING)
     return
@@ -482,11 +519,9 @@ async function run(
 
   const { spinner } = constants
 
-  const includePatterns = cmdFlagValueToArray(include)
-  const excludePatterns = cmdFlagValueToArray(exclude)
-
   await handleFix({
     all,
+    allowOverrides,
     applyFixes,
     autopilot,
     coanaVersion: fixVersion,
@@ -494,8 +529,10 @@ async function run(
     debug,
     disableExternalToolChecks,
     disableMajorUpdates,
+    dynamicSbomInference,
     ecosystems: validatedEcosystems,
     exclude: excludePatterns,
+    excludePaths: excludePathsPatterns,
     ghsas,
     include: includePatterns,
     minimumReleaseAge,

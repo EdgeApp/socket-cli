@@ -90,6 +90,12 @@ function getTestEnv(apiToken: string): Record<string, string | undefined> {
     http_proxy: undefined,
     https_proxy: undefined,
     SOCKET_CLI_API_PROXY: undefined,
+    // A firewall proxy (e.g. sfw in CI) also points these at its own CA, which
+    // then becomes the only trusted root for direct connections.
+    GIT_SSL_CAINFO: undefined,
+    PIP_CERT: undefined,
+    SSL_CERT_DIR: undefined,
+    SSL_CERT_FILE: undefined,
   }
 }
 
@@ -327,14 +333,21 @@ describe('socket scan reach (E2E tests)', async () => {
           expect(Array.isArray(facts.components)).toBe(true)
           expect(Array.isArray(facts.workspaceDiagnostics)).toBe(true)
 
-          // Verify workspace diagnostics includes all 3 subprojects.
-          const subprojectPaths = facts.workspaceDiagnostics.map(
-            d => d.subprojectPath,
+          // Verify workspace diagnostics includes all 3 workspaces. Since
+          // Coana v15.10.8, subprojectPath identifies the build root and
+          // workspacePath the workspace within it, so this single-root npm
+          // monorepo reports one `.` subproject holding three workspaces.
+          const workspacePaths = facts.workspaceDiagnostics.map(
+            d => d.workspacePath,
           )
-          expect(subprojectPaths).toContain('.')
-          expect(subprojectPaths).toContain('packages/package-a')
-          expect(subprojectPaths).toContain('packages/package-b')
+          expect(workspacePaths).toContain('.')
+          expect(workspacePaths).toContain('packages/package-a')
+          expect(workspacePaths).toContain('packages/package-b')
           expect(facts.workspaceDiagnostics).toHaveLength(3)
+          expect(
+            facts.workspaceDiagnostics.every(d => d.subprojectPath === '.'),
+            'all workspaces should belong to the single `.` build root',
+          ).toBe(true)
 
           // Verify components count is reasonable (should be > 100 for this workspace).
           expect(facts.components.length).toBeGreaterThan(100)
@@ -694,13 +707,13 @@ describe('socket scan reach (E2E tests)', async () => {
           // Read and validate the facts file structure.
           const facts = await readSocketFactsJson(tempFixture.path)
 
-          // Verify all workspace subprojects are found when using --cwd.
-          const subprojectPaths = facts.workspaceDiagnostics.map(
-            d => d.subprojectPath,
+          // Verify all workspaces are found when using --cwd.
+          const workspacePaths = facts.workspaceDiagnostics.map(
+            d => d.workspacePath,
           )
-          expect(subprojectPaths).toContain('.')
-          expect(subprojectPaths).toContain('packages/package-a')
-          expect(subprojectPaths).toContain('packages/package-b')
+          expect(workspacePaths).toContain('.')
+          expect(workspacePaths).toContain('packages/package-a')
+          expect(workspacePaths).toContain('packages/package-b')
 
           // Verify we have components.
           expect(facts.components.length).toBeGreaterThan(100)
@@ -973,11 +986,6 @@ describe('socket scan reach (E2E tests)', async () => {
         // Coana v15 halts on by default. The test asserts on the ecosystem
         // filter, not source-file presence.
         '--reach-continue-on-no-source-files',
-        // The CI runner's network firewall blocks pypi.org, so the pypi
-        // pre-install step fails. Coana v15 halts on install errors by
-        // default; this test asserts on ecosystem-filter discovery, not
-        // successful installation.
-        '--reach-continue-on-install-errors',
       ],
       'should only analyze pypi ecosystem when --reach-ecosystems pypi is specified',
       async cmd => {

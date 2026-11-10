@@ -1,6 +1,6 @@
 import path from 'node:path'
 
-import { describe, expect } from 'vitest'
+import { describe, expect, it } from 'vitest'
 
 import constants, {
   FLAG_CONFIG,
@@ -16,6 +16,70 @@ const fixtureBaseDir = path.join(testPath, 'fixtures/commands/scan/create')
 
 describe('socket scan create', async () => {
   const { binCliPath } = constants
+
+  const uvFixture = path.join(testPath, 'fixtures/commands/scan/uv-workspace')
+  const uvBaseArgs = [
+    'scan',
+    'create',
+    '--cwd',
+    uvFixture,
+    '--org',
+    'test-org',
+    '--repo',
+    'test-repo',
+    '--branch',
+    'main',
+    '--dry-run',
+    '--no-interactive',
+    FLAG_CONFIG,
+    '{}',
+  ]
+
+  it(
+    'accepts uv member directories as targets',
+    { timeout: 30_000 },
+    async () => {
+      const result = await spawnSocketCli(binCliPath, [
+        ...uvBaseArgs,
+        '--uv-members',
+        'packages/api',
+        'packages/other',
+      ])
+      expect(result.code).toBe(0)
+      expect(result.stdout).toContain('[DryRun]: Bailing now')
+    },
+  )
+
+  it.each([
+    {
+      args: ['--uv-members', 'packages/missing'],
+      error: 'directory inside --cwd',
+    },
+    {
+      args: ['--uv-members', '..'],
+      error: 'directory inside --cwd',
+    },
+    {
+      args: ['--uv-members', 'packages'],
+      error: 'requires a pyproject.toml in every TARGET',
+    },
+    {
+      args: ['--uv-members', 'packages/api', '--auto-manifest'],
+      error: 'cannot be combined',
+    },
+    {
+      args: ['--uv-members', 'packages/api', '--dynamic-sbom-inference'],
+      error: 'cannot be combined',
+    },
+  ])(
+    'rejects invalid uv member options: $args',
+    { timeout: 30_000 },
+    async ({ args, error }) => {
+      const result = await spawnSocketCli(binCliPath, [...uvBaseArgs, ...args])
+      expect(result.code).not.toBe(0)
+      expect(result.stdout + result.stderr).toContain(error)
+    },
+  )
 
   cmdit(
     ['scan', 'create', FLAG_HELP, FLAG_CONFIG, '{}'],
@@ -33,42 +97,49 @@ describe('socket scan create', async () => {
             - Permissions: full-scans:create
 
           Options
-            --auto-manifest     Run \`socket manifest auto\` before collecting manifest files. This is necessary for languages like Scala, Gradle, and Kotlin, See \`socket manifest auto --help\`.
+            --auto-manifest     Run \`socket manifest auto\` before collecting manifest files, which generates them for ecosystems that need their build tool to resolve dependencies, such as Scala, Gradle, and Kotlin. See \`socket manifest auto --help\`. For Gradle, sbt, Maven and .NET, --dynamic-sbom-inference generates a Socket facts SBOM per build root instead.
             --branch            Branch name
             --commit-hash       Commit hash
             --commit-message    Commit message
             --committers        Committers
             --cwd               working directory, defaults to process.cwd()
             --default-branch    Set the default branch of the repository to the branch of this full-scan. Should only need to be done once, for example for the "main" or "master" branch.
-            --exclude-paths     List of glob patterns to exclude from the scan, including SCA/SBOM manifest discovery and (when --reach is enabled) Tier 1 reachability analysis. Patterns are anchored micromatch globs matched relative to the Socket scan root, which is the command working directory (\`--cwd\` if set), not the reachability target: \`tests\` matches only \`<cwd>/tests\`; use \`**/tests\` to match at any depth. Negation patterns (\`!path\`) are not supported. Accepts a comma-separated value or multiple flags.
+            --dynamic-sbom-inference  For Gradle, sbt, Maven and .NET: generate a Socket facts SBOM (produced directly by each package manager) per independent build root, instead of one synthetic root. Combine with --reach to split the reachability analysis per project/module.
+            --dynamic-sbom-inference-ecosystems  With --dynamic-sbom-inference: generate Socket facts only for these ecosystems, as either a comma separated value or as multiple flags; the others keep their manifest files as they are. Supported: maven (Gradle, Maven, and sbt) and nuget (.NET). Defaults to all of them.
+            --exclude-paths     List of glob patterns to exclude from the scan, including SCA/SBOM manifest discovery and (when --reach is enabled) full application reachability analysis. Patterns are anchored micromatch globs matched relative to the Socket scan root, which is the command working directory (\`--cwd\` if set), not the reachability target: \`tests\` matches only \`<cwd>/tests\`; use \`**/tests\` to match at any depth. Negation patterns (\`!path\`) are not supported. Accepts a comma-separated value or multiple flags. An excluded JVM build module or .NET project is not analysed as a project of its own, but where a project that is not excluded depends on it, its code is analysed as part of that project. A build module or project outside the scan root cannot be excluded.
             --interactive       Allow for interactive elements, asking for input. Use --no-interactive to prevent any input questions, defaulting them to cancel/no.
             --json              Output as JSON
             --markdown          Output as Markdown
             --org               Force override the organization slug, overrides the default org from config
             --pull-request      Pull request number
-            --reach             Run tier 1 full application reachability analysis
+            --reach             Run full application reachability analysis
             --read-only         Similar to --dry-run except it can read from remote, stops before it would create an actual report
             --repo              Repository name
             --report            Wait for the scan creation to complete, then basically run \`socket scan report\` on it
             --report-level      Which policy level alerts should be reported (default 'error')
             --set-as-alerts-page  When true and if this is the "default branch" then this Scan will be the one reflected on your alerts page. See help for details. Defaults to true.
             --tmp               Set the visibility (true/false) of the scan in your dashboard.
+            --uv-members        Scan each TARGET directory as a uv project, using the versions pinned in its uv.lock or its workspace root uv.lock. Uploads a CycloneDX dependency graph per TARGET in place of manifest discovery, including all extras and dependency groups. Requires uv on PATH.
             --workspace         The workspace in the Socket Organization that the repository is in to associate with the full scan.
 
           Reachability Options (when --reach is used)
-            --reach-analysis-memory-limit  The maximum memory in MB to use for the reachability analysis. The default is 8192MB.
-            --reach-analysis-timeout  Set timeout for the reachability analysis. Split analysis runs may cause the total scan time to exceed this timeout significantly.
-            --reach-concurrency  Set the maximum number of concurrent reachability analysis runs. It is recommended to choose a concurrency level that ensures each analysis run has at least the --reach-analysis-memory-limit amount of memory available. NPM reachability analysis does not support concurrent execution, so the concurrency level is ignored for NPM.
-            --reach-continue-on-analysis-errors  Continue reachability analysis when errors occur (timeouts, OOM, parse errors, etc.), falling back to precomputed (Tier 2) results. By default, the CLI halts on analysis errors.
-            --reach-continue-on-install-errors  Continue reachability analysis when package installation fails, falling back to precomputed (Tier 2) results. By default, the CLI halts on installation errors.
+            --reach-advisories  List of advisories to run reachability analysis for, as GHSA or CVE IDs, either as a comma separated value or as multiple flags. CVE IDs are converted to GHSA IDs through the GitHub API. Vulnerabilities from other advisories get unknown reachability. Defaults to all advisories.
+            --reach-analysis-memory-limit  The maximum memory for the reachability analysis as a whole number optionally followed by MB or GB (e.g. 512MB, 8GB). The default is 8GB.
+            --reach-analysis-timeout  Set the timeout for the reachability analysis as a whole number optionally followed by s, m or h (e.g. 90s, 10m, 1h). Defaults to 10m. Split analysis runs may cause the total scan time to exceed this timeout significantly.
+            --reach-concurrency  Set the maximum number of concurrent reachability analysis runs. It is recommended to choose a concurrency level that ensures each analysis run has at least the --reach-analysis-memory-limit amount of memory available.
+            --reach-continue-on-analysis-errors  Continue reachability analysis when errors occur (timeouts, OOM, parse errors, etc.), falling back to precomputed reachability results. By default, the CLI halts on analysis errors.
+            --reach-continue-on-install-errors  Continue reachability analysis when package installation fails, falling back to precomputed reachability results. By default, the CLI halts on installation errors.
             --reach-continue-on-missing-lock-files  Continue reachability analysis when a Gradle or SBT project is missing its lock file (or version catalog / pre-generated SBOM). By default, the CLI halts.
             --reach-continue-on-no-source-files  Continue reachability analysis when a workspace contains no source files for its ecosystem. By default, the CLI halts.
             --reach-debug       Enable debug mode for reachability analysis. Provides verbose logging from the reachability CLI.
             --reach-detailed-analysis-log-file  A log file with detailed analysis logs is written to root of each analyzed workspace.
             --reach-disable-analytics  Disable reachability analytics sharing with Socket. Also disables caching-based optimizations.
+            --reach-disable-dependency-downloads  Only analyze dependencies that are already installed (e.g. in the project's .venv, vendor directory or module cache). Missing dependencies count as installation failures.
             --reach-disable-external-tool-checks  Disable external tool checks during reachability analysis.
-            --reach-ecosystems  List of ecosystems to conduct reachability analysis on, as either a comma separated value or as multiple flags. Defaults to all ecosystems.
+            --reach-ecosystems  List of ecosystems to conduct reachability analysis on, as either a comma separated value or as multiple flags. Supported: cargo, composer, gem, golang, maven, npm, nuget, pypi. Defaults to all supported ecosystems.
             --reach-enable-analysis-splitting  Allow the reachability analysis to partition CVEs into buckets that are processed in separate analysis runs. May improve accuracy, but not recommended by default.
+            --reach-fallback-to-regular-scan  If reachability analysis fails, continue with a regular SCA scan (without reachability results) instead of halting. By default, the CLI halts on reachability errors.
+            --reach-retain-facts-file  Keep the \`.socket.facts.json\` reachability report that the analysis writes to the scan directory instead of deleting it after a successful scan. Delete it once inspected: later reachability scans ignore it, but a scan without --reach uploads it as an SBOM carrying stale reachability results.
             --reach-skip-cache  Skip caching-based optimizations. By default, the reachability analysis will use cached configurations from previous runs to speed up the analysis.
             --reach-use-only-pregenerated-sboms  When using this option, the scan is created based only on pre-generated CDX and SPDX files in your project.
             --reach-version     Override the version of @coana-tech/cli used for reachability analysis. Default: <coana-version>.
@@ -106,7 +177,8 @@ describe('socket scan create', async () => {
           Examples
             $ socket scan create
             $ socket scan create ./proj --json
-            $ socket scan create --repo=test-repo --branch=main ./package.json"
+            $ socket scan create --repo=test-repo --branch=main ./package.json
+            $ socket scan create --uv-members ./packages/api ./packages/worker"
       `)
       expect(`\n   ${stderr}`).toMatchInlineSnapshot(`
         "
@@ -197,6 +269,182 @@ describe('socket scan create', async () => {
       'xyz',
       '--branch',
       'abc',
+      '--reach-debug',
+      FLAG_CONFIG,
+      '{"apiToken":"fakeToken"}',
+    ],
+    'should fail when --reach-debug is used without --reach',
+    async cmd => {
+      const { code, stderr, stdout } = await spawnSocketCli(binCliPath, cmd)
+      const output = stdout + stderr
+      expect(output).toContain(
+        'Reachability analysis flags require --reach to be enabled',
+      )
+      expect(output).toContain('add --reach flag to use --reach-* options')
+      expect(
+        code,
+        'should exit with non-zero code when validation fails',
+      ).not.toBe(0)
+    },
+  )
+
+  cmdit(
+    [
+      'scan',
+      'create',
+      FLAG_ORG,
+      'fakeOrg',
+      'target',
+      FLAG_DRY_RUN,
+      '--repo',
+      'xyz',
+      '--branch',
+      'abc',
+      '--reach-retain-facts-file',
+      FLAG_CONFIG,
+      '{"apiToken":"fakeToken"}',
+    ],
+    'should fail when --reach-retain-facts-file is used without --reach',
+    async cmd => {
+      const { code, stderr, stdout } = await spawnSocketCli(binCliPath, cmd)
+      const output = stdout + stderr
+      expect(output).toContain(
+        'Reachability analysis flags require --reach to be enabled',
+      )
+      expect(output).toContain('add --reach flag to use --reach-* options')
+      expect(
+        code,
+        'should exit with non-zero code when validation fails',
+      ).not.toBe(0)
+    },
+  )
+
+  cmdit(
+    [
+      'scan',
+      'create',
+      FLAG_ORG,
+      'fakeOrg',
+      'target',
+      FLAG_DRY_RUN,
+      '--repo',
+      'xyz',
+      '--branch',
+      'abc',
+      '--reach-fallback-to-regular-scan',
+      FLAG_CONFIG,
+      '{"apiToken":"fakeToken"}',
+    ],
+    'should fail when --reach-fallback-to-regular-scan is used without --reach',
+    async cmd => {
+      const { code, stderr, stdout } = await spawnSocketCli(binCliPath, cmd)
+      const output = stdout + stderr
+      expect(output).toContain(
+        'Reachability analysis flags require --reach to be enabled',
+      )
+      expect(output).toContain('add --reach flag to use --reach-* options')
+      expect(
+        code,
+        'should exit with non-zero code when validation fails',
+      ).not.toBe(0)
+    },
+  )
+
+  cmdit(
+    [
+      'scan',
+      'create',
+      FLAG_ORG,
+      'fakeOrg',
+      'target',
+      FLAG_DRY_RUN,
+      '--repo',
+      'xyz',
+      '--branch',
+      'abc',
+      '--reach-disable-analysis-splitting',
+      FLAG_CONFIG,
+      '{"apiToken":"fakeToken"}',
+    ],
+    'should succeed when deprecated no-op --reach-disable-analysis-splitting is used without --reach',
+    async cmd => {
+      const { code, stdout } = await spawnSocketCli(binCliPath, cmd)
+      expect(stdout).toMatchInlineSnapshot(`"[DryRun]: Bailing now"`)
+      expect(
+        code,
+        'should exit with code 0 for the deprecated no-op flag',
+      ).toBe(0)
+    },
+  )
+
+  cmdit(
+    [
+      'scan',
+      'create',
+      FLAG_ORG,
+      'fakeOrg',
+      'target',
+      FLAG_DRY_RUN,
+      '--repo',
+      'xyz',
+      '--branch',
+      'abc',
+      '--dynamic-sbom-inference',
+      FLAG_CONFIG,
+      '{"apiToken":"fakeToken"}',
+    ],
+    'should succeed when --dynamic-sbom-inference is used without --reach',
+    async cmd => {
+      const { code, stderr, stdout } = await spawnSocketCli(binCliPath, cmd)
+      expect(stdout).toMatchInlineSnapshot(`"[DryRun]: Bailing now"`)
+      expect(stdout + stderr).not.toContain(
+        'Reachability analysis flags require --reach to be enabled',
+      )
+      expect(
+        code,
+        'should exit with code 0 since it is not a reachability modifier',
+      ).toBe(0)
+    },
+  )
+
+  cmdit(
+    [
+      'scan',
+      'create',
+      FLAG_ORG,
+      'fakeOrg',
+      'target',
+      FLAG_DRY_RUN,
+      '--repo',
+      'xyz',
+      '--branch',
+      'abc',
+      '--dynamic-sbom-inference',
+      '--dynamic-sbom-inference-ecosystems',
+      'Maven,NuGet',
+      FLAG_CONFIG,
+      '{"apiToken":"fakeToken"}',
+    ],
+    'should succeed when --dynamic-sbom-inference-ecosystems selects supported ecosystems without --reach',
+    async cmd => {
+      const { code, stdout } = await spawnSocketCli(binCliPath, cmd)
+      expect(stdout).toMatchInlineSnapshot(`"[DryRun]: Bailing now"`)
+      expect(code).toBe(0)
+    },
+  )
+
+  cmdit(
+    [
+      'scan',
+      'create',
+      FLAG_ORG,
+      'fakeOrg',
+      'target',
+      FLAG_DRY_RUN,
+      '--repo',
+      'xyz',
+      '--branch',
+      'abc',
       '--exclude-paths',
       'tests',
       FLAG_CONFIG,
@@ -263,6 +511,56 @@ describe('socket scan create', async () => {
       const { code, stdout } = await spawnSocketCli(binCliPath, cmd)
       expect(stdout).toMatchInlineSnapshot(`"[DryRun]: Bailing now"`)
       expect(code, 'should exit with code 0 when using default value').toBe(0)
+    },
+  )
+
+  cmdit(
+    [
+      'scan',
+      'create',
+      FLAG_ORG,
+      'fakeOrg',
+      'target',
+      FLAG_DRY_RUN,
+      '--repo',
+      'xyz',
+      '--branch',
+      'abc',
+      '--reach-analysis-memory-limit',
+      '8GB',
+      FLAG_CONFIG,
+      '{"apiToken":"fakeToken"}',
+    ],
+    'should succeed when --reach-analysis-memory-limit equals the default in a different unit (8GB) without --reach',
+    async cmd => {
+      const { code, stdout } = await spawnSocketCli(binCliPath, cmd)
+      expect(stdout).toMatchInlineSnapshot(`"[DryRun]: Bailing now"`)
+      expect(code, 'should treat 8GB as the default 8192MB').toBe(0)
+    },
+  )
+
+  cmdit(
+    [
+      'scan',
+      'create',
+      FLAG_ORG,
+      'fakeOrg',
+      'target',
+      FLAG_DRY_RUN,
+      '--repo',
+      'xyz',
+      '--branch',
+      'abc',
+      '--reach-analysis-timeout',
+      '0',
+      FLAG_CONFIG,
+      '{"apiToken":"fakeToken"}',
+    ],
+    'should succeed when --reach-analysis-timeout is the zero/omit sentinel without --reach',
+    async cmd => {
+      const { code, stdout } = await spawnSocketCli(binCliPath, cmd)
+      expect(stdout).toMatchInlineSnapshot(`"[DryRun]: Bailing now"`)
+      expect(code, 'should treat 0 as the default (omit) timeout').toBe(0)
     },
   )
 
@@ -532,6 +830,31 @@ describe('socket scan create', async () => {
       '--branch',
       'abc',
       '--reach',
+      '--reach-fallback-to-regular-scan',
+      FLAG_CONFIG,
+      '{"apiToken":"fakeToken"}',
+    ],
+    'should succeed when --reach-fallback-to-regular-scan is used with --reach',
+    async cmd => {
+      const { code, stdout } = await spawnSocketCli(binCliPath, cmd)
+      expect(stdout).toMatchInlineSnapshot(`"[DryRun]: Bailing now"`)
+      expect(code, 'should exit with code 0 when all flags are valid').toBe(0)
+    },
+  )
+
+  cmdit(
+    [
+      'scan',
+      'create',
+      FLAG_ORG,
+      'fakeOrg',
+      'test/fixtures/commands/scan/simple-npm',
+      FLAG_DRY_RUN,
+      '--repo',
+      'xyz',
+      '--branch',
+      'abc',
+      '--reach',
       '--reach-exclude-paths',
       'node_modules,dist,build',
       FLAG_CONFIG,
@@ -670,8 +993,11 @@ describe('socket scan create', async () => {
     async cmd => {
       const { code, stderr, stdout } = await spawnSocketCli(binCliPath, cmd)
       const output = stdout + stderr
+      // With SDK v4 the supported-manifest-files lookup is org-scoped, so an
+      // invalid token now fails at authentication before the glob runs; a valid
+      // token still reaches the "no eligible files" message on an empty dir.
       expect(output).toMatch(
-        /found no eligible files to scan|An error was thrown while requesting/,
+        /found no eligible files to scan|An error was thrown while requesting|Socket API error|Authentication failed/,
       )
       expect(
         code,

@@ -160,16 +160,19 @@ describe('socket fix', async () => {
 
           API Token Requirements
             - Quota: 101 units
-            - Permissions: full-scans:create and packages:list
+            - Permissions: fixes:list, full-scans:create, and packages:list
 
           Options
             --all               Process all discovered vulnerabilities in local mode. Cannot be used with --id.
+            --allow-overrides   When the only fix for a vulnerability is blocked by a parent package's declared version range, write an override or resolution that forces the fixed version under that parent. This can install a version outside the range the parent declares, so test the parent afterwards. Works for npm, pnpm, Yarn and Rush projects.
             --autopilot         Enable auto-merge for pull requests that Socket opens.
                                 See GitHub documentation (https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/configuring-pull-request-merges/managing-auto-merge-for-pull-requests-in-your-repository) for managing auto-merge for pull requests in your repository.
             --debug             Enable debug logging in the Coana-based Socket Fix CLI invocation.
             --disable-external-tool-checks  Disable external tool checks during fix analysis.
+            --dynamic-sbom-inference  For Gradle, sbt, Maven and .NET: generate a Socket facts SBOM (produced directly by each package manager) per independent build root, instead of one synthetic root. Fixes are then attributed to the projects/modules that actually resolve each vulnerable dependency. The generated files are removed afterwards.
+            --dynamic-sbom-inference-ecosystems  With --dynamic-sbom-inference: generate Socket facts only for these ecosystems, as either a comma separated value or as multiple flags; the others keep their manifest files as they are. Supported: maven (Gradle, Maven, and sbt) and nuget (.NET). Defaults to all of them.
             --ecosystems        Limit fix analysis to specific ecosystems. Accepts space- or comma-separated values and is case-insensitive. Defaults to all ecosystems.
-            --exclude           Exclude workspaces matching these glob patterns. Can be provided as comma separated values or as multiple flags
+            --exclude-paths     Skip matching paths from the scan entirely: manifests under these paths are not uploaded, and fixes are not applied to workspaces under them. Patterns are anchored micromatch globs matched relative to the target directory (CWD); \`data/postgres/pgdata\` matches that exact path, \`**/pgdata\` matches at any depth. Use this to skip directories the current user cannot read so they do not abort manifest collection. Negation patterns (\`!path\`) are not supported. Accepts a comma-separated value or multiple flags.
             --fix-version       Override the version of @coana-tech/cli used for fix analysis. Default: <coana-version>.
             --id                Provide a list of vulnerability identifiers to compute fixes for:
                                     - GHSA IDs (https://docs.github.com/en/code-security/security-advisories/working-with-global-security-advisories-from-the-github-advisory-database/about-the-github-advisory-database#about-ghsa-ids) (e.g., GHSA-xxxx-xxxx-xxxx)
@@ -390,6 +393,22 @@ describe('socket fix', async () => {
       '{"apiToken":"fakeToken"}',
     ],
     'should accept --no-major-updates flag',
+    async cmd => {
+      const { code, stdout } = await spawnSocketCli(binCliPath, cmd)
+      expect(stdout).toMatchInlineSnapshot(`"[DryRun]: Not saving"`)
+      expect(code, 'should exit with code 0').toBe(0)
+    },
+  )
+
+  cmdit(
+    [
+      'fix',
+      FLAG_DRY_RUN,
+      '--allow-overrides',
+      FLAG_CONFIG,
+      '{"apiToken":"fakeToken"}',
+    ],
+    'should accept --allow-overrides flag',
     async cmd => {
       const { code, stdout } = await spawnSocketCli(binCliPath, cmd)
       expect(stdout).toMatchInlineSnapshot(`"[DryRun]: Not saving"`)

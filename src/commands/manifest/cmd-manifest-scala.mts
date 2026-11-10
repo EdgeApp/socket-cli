@@ -3,14 +3,20 @@ import path from 'node:path'
 import { debugFn } from '@socketsecurity/registry/lib/debug'
 import { logger } from '@socketsecurity/registry/lib/logger'
 
+import { convertSbtToFacts } from './convert-sbt-to-facts.mts'
 import { convertSbtToMaven } from './convert_sbt_to_maven.mts'
+import { excludePathsFlag } from './manifest-flags.mts'
+import { parseBuildToolOpts } from './parse-build-tool-opts.mts'
 import constants, { REQUIREMENTS_TXT, SOCKET_JSON } from '../../constants.mts'
 import { commonFlags } from '../../flags.mts'
 import { checkCommandInput } from '../../utils/check-input.mts'
+import { cmdFlagValueToArray } from '../../utils/cmd.mts'
+import { withTmpDir } from '../../utils/fs.mts'
 import { getOutputKind } from '../../utils/get-output-kind.mts'
 import { meowOrExit } from '../../utils/meow-with-subcommands.mts'
 import { getFlagListOutput } from '../../utils/output-formatting.mts'
 import { readOrDefaultSocketJson } from '../../utils/socket-json.mts'
+import { assertValidExcludePaths } from '../scan/exclude-paths.mts'
 
 import type {
   CliCommandConfig,
@@ -20,7 +26,7 @@ import type {
 const config: CliCommandConfig = {
   commandName: 'scala',
   description:
-    "[beta] Generate a manifest file (`pom.xml`) from Scala's `build.sbt` file",
+    '[beta] Generate a Socket facts file (or `pom.xml` with --pom) from a Scala `build.sbt` project',
   hidden: false,
   flags: {
     ...commonFlags,
@@ -28,14 +34,41 @@ const config: CliCommandConfig = {
       type: 'string',
       description: 'Location of sbt binary to use',
     },
+    facts: {
+      type: 'boolean',
+      description:
+        'Emit a Socket facts JSON file (`sbt.socket.facts.json`) describing the resolved dependency graph. This is the default; pass `--pom` to generate `pom.xml` files instead',
+    },
+    pom: {
+      type: 'boolean',
+      description:
+        'Generate `pom.xml` manifest file(s) instead of the default Socket facts file (`sbt.socket.facts.json`)',
+    },
+    includeConfigs: {
+      type: 'string',
+      description:
+        'When generating facts: comma-separated glob patterns matched against sbt configuration names (case-sensitive; `*`, `?`, and `[...]` wildcards). Only configurations matching at least one pattern are resolved. e.g. `compile,test`. Default: compile,optional,provided,runtime,test',
+    },
+    excludeConfigs: {
+      type: 'string',
+      description:
+        'When generating facts: comma-separated glob patterns; sbt configurations matching any pattern are skipped (applied after --include-configs)',
+    },
+    ...excludePathsFlag,
+    ignoreUnresolved: {
+      type: 'boolean',
+      description:
+        'When generating facts: warn on unresolved dependencies instead of failing the run (unresolved deps are not emitted to the facts file)',
+    },
     out: {
       type: 'string',
       description:
-        'Path of output file; where to store the resulting manifest, see also --stdout',
+        'Only with --pom: path of the output `pom.xml`, see also --stdout. Does not apply when generating Socket facts (always written to the project root as `sbt.socket.facts.json`)',
     },
     stdout: {
       type: 'boolean',
-      description: 'Print resulting pom.xml to stdout (supersedes --out)',
+      description:
+        'Only with --pom: print the resulting `pom.xml` to stdout (supersedes --out). Does not apply when generating Socket facts',
     },
     sbtOpts: {
       type: 'string',
@@ -53,11 +86,18 @@ const config: CliCommandConfig = {
     Options
       ${getFlagListOutput(config.flags)}
 
-    Uses \`sbt makePom\` to generate a \`pom.xml\` from your \`build.sbt\` file.
-    This xml file is the dependency manifest (like a package.json
-    for Node.js or ${REQUIREMENTS_TXT} for PyPi), but specifically for Scala.
+    By default, emits a single \`sbt.socket.facts.json\` describing the
+    resolved dependency graph of the whole build. It reads dependency metadata only and
+    never downloads artifacts; an unresolved dependency is a fatal error. You
+    can pass --include-configs / --exclude-configs (comma-separated glob
+    patterns) to control which sbt configurations are resolved (e.g.
+    --include-configs=\`compile,test\`), and --ignore-unresolved to warn on
+    unresolved dependencies instead of failing the run.
 
-    There are some caveats with \`build.sbt\` to \`pom.xml\` conversion:
+    Pass --pom to instead generate a \`pom.xml\` via \`sbt makePom\` from your
+    \`build.sbt\`. The xml is the dependency manifest (like a package.json for
+    Node.js or ${REQUIREMENTS_TXT} for PyPi), but specifically for Scala.
+    Caveats of the \`build.sbt\` to \`pom.xml\` conversion:
 
     - the xml is exported as pom.xml at the project root so Socket scan picks
       it up; sbt itself first writes it inside your /target/sbt<version> folder
@@ -83,6 +123,7 @@ const config: CliCommandConfig = {
     Examples
 
       $ ${command}
+      $ ${command} --pom .
       $ ${command} ./proj --bin=/usr/bin/sbt --file=boot.sbt
   `,
 }
@@ -125,7 +166,17 @@ async function run(
     sockJson?.defaults?.manifest?.sbt,
   )
 
-  let { bin, out, sbtOpts, stdout, verbose } = cli.flags
+  let {
+    bin,
+    excludeConfigs,
+    facts,
+    ignoreUnresolved,
+    includeConfigs,
+    out,
+    sbtOpts,
+    stdout,
+    verbose,
+  } = cli.flags
 
   // Set defaults for any flag/arg that is not given. Check socket.json first.
   if (!bin) {
@@ -134,6 +185,59 @@ async function run(
       logger.info(`Using default --bin from ${SOCKET_JSON}:`, bin)
     } else {
       bin = 'sbt'
+    }
+  }
+  if (facts === undefined) {
+    if (sockJson.defaults?.manifest?.sbt?.facts !== undefined) {
+      facts = sockJson.defaults?.manifest?.sbt?.facts
+      logger.info(`Using default --facts from ${SOCKET_JSON}:`, facts)
+    } else {
+      // Socket facts generation is the default; pass --pom to generate poms.
+      facts = true
+    }
+  }
+  // --pom opts into legacy pom.xml generation. It overrides the facts default
+  // (and the socket.json default) but conflicts with an explicit --facts.
+  if (cli.flags['pom']) {
+    if (cli.flags['facts'] !== undefined) {
+      logger.warn(
+        'The `--facts` and `--pom` options are mutually exclusive; generating Socket facts.',
+      )
+    } else {
+      facts = false
+    }
+  }
+  if (includeConfigs === undefined) {
+    if (sockJson.defaults?.manifest?.sbt?.includeConfigs) {
+      includeConfigs = sockJson.defaults.manifest.sbt.includeConfigs
+      logger.info(
+        `Using default --include-configs from ${SOCKET_JSON}:`,
+        includeConfigs,
+      )
+    } else {
+      includeConfigs = ''
+    }
+  }
+  if (excludeConfigs === undefined) {
+    if (sockJson.defaults?.manifest?.sbt?.excludeConfigs) {
+      excludeConfigs = sockJson.defaults.manifest.sbt.excludeConfigs
+      logger.info(
+        `Using default --exclude-configs from ${SOCKET_JSON}:`,
+        excludeConfigs,
+      )
+    } else {
+      excludeConfigs = ''
+    }
+  }
+  if (ignoreUnresolved === undefined) {
+    if (sockJson.defaults?.manifest?.sbt?.ignoreUnresolved !== undefined) {
+      ignoreUnresolved = sockJson.defaults?.manifest?.sbt?.ignoreUnresolved
+      logger.info(
+        `Using default --ignore-unresolved from ${SOCKET_JSON}:`,
+        ignoreUnresolved,
+      )
+    } else {
+      ignoreUnresolved = false
     }
   }
   if (
@@ -171,6 +275,22 @@ async function run(
     verbose = false
   }
 
+  // `--include-configs`, `--exclude-configs`, and `--ignore-unresolved` only
+  // affect facts generation; the pom path (`sbt makePom`) has no equivalent
+  // knobs. Warn rather than silently ignore an explicitly-passed flag.
+  // (socket.json defaults don't trip this — only a flag actually present on the
+  // command line does.)
+  if (
+    !facts &&
+    (cli.flags['includeConfigs'] !== undefined ||
+      cli.flags['excludeConfigs'] !== undefined ||
+      cli.flags['ignoreUnresolved'] !== undefined)
+  ) {
+    logger.warn(
+      'The `--include-configs`, `--exclude-configs`, and `--ignore-unresolved` options only apply when generating Socket facts (not with `--pom`); ignoring them.',
+    )
+  }
+
   if (verbose) {
     logger.group('- ', parentName, config.commandName, ':')
     logger.group('- flags:', cli.flags)
@@ -183,21 +303,41 @@ async function run(
   //       try, store contents in a file in some folder, target that folder... what
   //       would the file name be?
 
-  const wasValidInput = checkCommandInput(outputKind, {
-    nook: true,
-    test: cli.input.length <= 1,
-    message: 'Can only accept one DIR (make sure to escape spaces!)',
-    fail: 'received ' + cli.input.length,
-  })
+  // --out / --stdout only affect the pom path. Socket facts are always written
+  // to the project root as `sbt.socket.facts.json` so that `socket scan create`
+  // picks them up, so reject these flags in facts mode rather than silently
+  // ignoring an explicitly-passed output location.
+  const wasValidInput = checkCommandInput(
+    outputKind,
+    {
+      nook: true,
+      test: cli.input.length <= 1,
+      message: 'Can only accept one DIR (make sure to escape spaces!)',
+      fail: 'received ' + cli.input.length,
+    },
+    {
+      nook: true,
+      test: !(
+        facts &&
+        (cli.flags['out'] !== undefined || cli.flags['stdout'] !== undefined)
+      ),
+      message:
+        'The `--out` and `--stdout` options only apply with `--pom`; Socket facts are always written to the project root as `sbt.socket.facts.json`',
+      fail: 'remove --out/--stdout, or pass --pom',
+    },
+  )
   if (!wasValidInput) {
     return
   }
+
+  const javaHome = sockJson.defaults?.manifest?.sbt?.javaHome ?? undefined
 
   if (verbose) {
     logger.group()
     logger.log('- target:', cwd)
     logger.log('- sbt bin:', bin)
     logger.log('- out:', out)
+    logger.log('- java home:', javaHome || '(inherited)')
     logger.groupEnd()
   }
 
@@ -206,14 +346,34 @@ async function run(
     return
   }
 
+  const parsedSbtOpts = parseBuildToolOpts(String(sbtOpts || ''))
+
+  const excludePaths = cmdFlagValueToArray(cli.flags['excludePaths'])
+  assertValidExcludePaths(excludePaths)
+
+  if (facts) {
+    await withTmpDir('socket-manifest-scala-', tmpDir =>
+      convertSbtToFacts({
+        bin: String(bin),
+        cwd,
+        excludeConfigs: String(excludeConfigs || ''),
+        excludePaths,
+        ignoreUnresolved: Boolean(ignoreUnresolved),
+        includeConfigs: String(includeConfigs || ''),
+        javaHome,
+        sbtOpts: parsedSbtOpts,
+        tmpDir,
+        verbose: Boolean(verbose),
+      }),
+    )
+    return
+  }
+
   await convertSbtToMaven({
     bin: String(bin),
-    cwd: cwd,
+    cwd,
     out: String(out),
-    sbtOpts: String(sbtOpts)
-      .split(' ')
-      .map(s => s.trim())
-      .filter(Boolean),
+    sbtOpts: parsedSbtOpts,
     verbose: Boolean(verbose),
   })
 }

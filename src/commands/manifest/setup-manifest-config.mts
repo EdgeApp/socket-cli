@@ -13,7 +13,45 @@ import {
 } from '../../utils/socket-json.mts'
 
 import type { CResult } from '../../types.mts'
-import type { SocketJson } from '../../utils/socket-json.mts'
+import type { ManifestDefaults } from '../../utils/socket-json.mts'
+
+// Whether the prompt was canceled. A blank answer clears a value set before
+// with null rather than deleting the key, so it doesn't silently start
+// inheriting an ancestor's value again.
+function applyAnswer<K extends string>(
+  config: { [P in K]?: string | null | undefined },
+  key: K,
+  answer: string | undefined,
+): boolean {
+  if (answer === undefined) {
+    return true
+  }
+  if (answer) {
+    config[key] = answer
+  } else if (config[key] !== undefined) {
+    config[key] = null
+  } else {
+    delete config[key]
+  }
+  return false
+}
+
+// Whether the prompt was canceled.
+function applyYesNo<K extends string>(
+  config: { [P in K]?: boolean | undefined },
+  key: K,
+  answer: string | undefined,
+): boolean {
+  if (answer === undefined) {
+    return true
+  }
+  if (answer === 'yes' || answer === 'no') {
+    config[key] = answer === 'yes'
+  } else {
+    delete config[key]
+  }
+  return false
+}
 
 export async function setupManifestConfig(
   cwd: string,
@@ -54,6 +92,12 @@ export async function setupManifestConfig(
 
   const choices = [
     {
+      name: '.NET (dotnet)'.padEnd(30, ' '),
+      value: 'dotnet',
+      description:
+        'Generate a Socket facts file for .NET solutions and projects through dotnet',
+    },
+    {
       name: 'Conda'.padEnd(30, ' '),
       value: 'conda',
       description: `Generate ${REQUIREMENTS_TXT} from a Conda environment.yml`,
@@ -61,22 +105,29 @@ export async function setupManifestConfig(
     {
       name: 'Gradle'.padEnd(30, ' '),
       value: 'gradle',
-      description: 'Generate pom.xml files through gradle',
+      description: 'Generate a Socket facts file or pom.xml through gradle',
     },
     {
       name: 'Kotlin (gradle)'.padEnd(30, ' '),
       value: 'gradle',
-      description: 'Generate pom.xml files (for Kotlin) through gradle',
+      description:
+        'Generate a Socket facts file or pom.xml (for Kotlin) through gradle',
+    },
+    {
+      name: 'Maven'.padEnd(30, ' '),
+      value: 'maven',
+      description: 'Generate a Socket facts file through maven',
     },
     {
       name: 'Scala (gradle)'.padEnd(30, ' '),
       value: 'gradle',
-      description: 'Generate pom.xml files (for Scala) through gradle',
+      description:
+        'Generate a Socket facts file or pom.xml (for Scala) through gradle',
     },
     {
       name: 'Scala (sbt)'.padEnd(30, ' '),
       value: 'sbt',
-      description: 'Generate pom.xml files through sbt',
+      description: 'Generate a Socket facts file or pom.xml through sbt',
     },
   ]
 
@@ -138,11 +189,25 @@ export async function setupManifestConfig(
       result = await setupConda(sockJson.defaults.manifest.conda)
       break
     }
+    case 'dotnet': {
+      if (!sockJson.defaults.manifest.dotnet) {
+        sockJson.defaults.manifest.dotnet = {}
+      }
+      result = await setupDotnet(sockJson.defaults.manifest.dotnet)
+      break
+    }
     case 'gradle': {
       if (!sockJson.defaults.manifest.gradle) {
         sockJson.defaults.manifest.gradle = {}
       }
       result = await setupGradle(sockJson.defaults.manifest.gradle)
+      break
+    }
+    case 'maven': {
+      if (!sockJson.defaults.manifest.maven) {
+        sockJson.defaults.manifest.maven = {}
+      }
+      result = await setupMaven(sockJson.defaults.manifest.maven)
       break
     }
     case 'sbt': {
@@ -189,9 +254,7 @@ export async function setupManifestConfig(
 }
 
 async function setupConda(
-  config: NonNullable<
-    NonNullable<NonNullable<SocketJson['defaults']>['manifest']>['conda']
-  >,
+  config: ManifestDefaults<'conda'>,
 ): Promise<CResult<{ canceled: boolean }>> {
   const on = await askForEnabled(!config.disabled)
   if (on === undefined) {
@@ -243,120 +306,218 @@ async function setupConda(
     }
   }
 
-  const verbose = await askForVerboseFlag(config.verbose)
-  if (verbose === undefined) {
+  if (applyYesNo(config, 'verbose', await askForVerboseFlag(config.verbose))) {
     return canceledByUser()
-  } else if (verbose === 'yes' || verbose === 'no') {
-    config.verbose = verbose === 'yes'
-  } else {
-    delete config.verbose
   }
 
   return notCanceled()
 }
 
-async function setupGradle(
-  config: NonNullable<
-    NonNullable<NonNullable<SocketJson['defaults']>['manifest']>['gradle']
-  >,
+export async function setupDotnet(
+  config: ManifestDefaults<'dotnet'>,
 ): Promise<CResult<{ canceled: boolean }>> {
-  const bin = await askForBin(config.bin || './gradlew')
-  if (bin === undefined) {
+  if (applyAnswer(config, 'bin', await askForBin(config.bin || '', 'dotnet'))) {
     return canceledByUser()
-  } else if (bin) {
-    config.bin = bin
-  } else {
-    delete config.bin
   }
 
-  const opts = await input({
-    message: '(--gradle-opts) Enter gradle options to pass through',
-    default: config.gradleOpts || '',
-    required: false,
-    // validate: async string => bool
-  })
-  if (opts === undefined) {
+  if (
+    applyAnswer(
+      config,
+      'dotnetOpts',
+      await input({
+        message:
+          '(--dotnet-opts) Enter options to pass to `dotnet restore`, e.g. `-p:Configuration=Release --configfile nuget.config`',
+        default: config.dotnetOpts || '',
+        required: false,
+      }),
+    )
+  ) {
     return canceledByUser()
-  } else if (opts) {
-    config.gradleOpts = opts
-  } else {
-    delete config.gradleOpts
   }
 
-  const verbose = await askForVerboseFlag(config.verbose)
-  if (verbose === undefined) {
+  const factsOptions = await setupFactsOptions(config, 'target framework')
+  if (!factsOptions.ok || factsOptions.data.canceled) {
+    return factsOptions
+  }
+
+  if (applyYesNo(config, 'verbose', await askForVerboseFlag(config.verbose))) {
     return canceledByUser()
-  } else if (verbose === 'yes' || verbose === 'no') {
-    config.verbose = verbose === 'yes'
-  } else {
-    delete config.verbose
   }
 
   return notCanceled()
 }
 
-async function setupSbt(
-  config: NonNullable<
-    NonNullable<NonNullable<SocketJson['defaults']>['manifest']>['sbt']
-  >,
+export async function setupGradle(
+  config: ManifestDefaults<'gradle'>,
+  // Set by the recursive dynamic-sbom-inference wizard, which has no
+  // pom-mode equivalent - skips the facts/pom question entirely.
+  { factsOnly = false }: { factsOnly?: boolean } = {},
 ): Promise<CResult<{ canceled: boolean }>> {
-  const bin = await askForBin(config.bin || 'sbt')
-  if (bin === undefined) {
+  if (
+    applyAnswer(config, 'bin', await askForBin(config.bin || '', './gradlew'))
+  ) {
     return canceledByUser()
-  } else if (bin) {
-    config.bin = bin
-  } else {
-    delete config.bin
   }
 
-  const opts = await input({
-    message: '(--sbt-opts) Enter sbt options to pass through',
-    default: config.sbtOpts || '',
-    required: false,
-    // validate: async string => bool
-  })
-  if (opts === undefined) {
+  if (
+    applyAnswer(config, 'javaHome', await askForJavaHome(config.javaHome || ''))
+  ) {
     return canceledByUser()
-  } else if (opts) {
-    config.sbtOpts = opts
-  } else {
-    delete config.sbtOpts
   }
 
-  const stdout = await askForStdout(config.stdout)
-  if (stdout === undefined) {
+  if (
+    applyAnswer(
+      config,
+      'gradleOpts',
+      await input({
+        message: '(--gradle-opts) Enter gradle options to pass through',
+        default: config.gradleOpts || '',
+        required: false,
+        // validate: async string => bool
+      }),
+    )
+  ) {
     return canceledByUser()
-  } else if (stdout === 'yes') {
-    config.stdout = true
-  } else if (stdout === 'no') {
-    config.stdout = false
-  } else {
-    delete config.stdout
   }
 
-  if (config.stdout !== true) {
-    const out = await askForOutputFile(config.outfile || 'sbt.pom.xml')
-    if (out === undefined) {
+  if (!factsOnly) {
+    if (applyYesNo(config, 'facts', await askForFactsFlag(config.facts))) {
       return canceledByUser()
-    } else if (out === '-') {
-      config.stdout = true
-    } else {
-      delete config.stdout
-      if (out) {
-        config.outfile = out
-      } else {
-        delete config.outfile
-      }
     }
   }
 
-  const verbose = await askForVerboseFlag(config.verbose)
-  if (verbose === undefined) {
+  // The config filters and --ignore-unresolved only apply to facts generation
+  // (the default); skip them when pom generation (--pom) is selected.
+  if (factsOnly || config.facts !== false) {
+    const factsOptions = await setupFactsOptions(config)
+    if (!factsOptions.ok || factsOptions.data.canceled) {
+      return factsOptions
+    }
+  }
+
+  if (applyYesNo(config, 'verbose', await askForVerboseFlag(config.verbose))) {
     return canceledByUser()
-  } else if (verbose === 'yes' || verbose === 'no') {
-    config.verbose = verbose === 'yes'
+  }
+
+  return notCanceled()
+}
+
+export async function setupMaven(
+  config: ManifestDefaults<'maven'>,
+): Promise<CResult<{ canceled: boolean }>> {
+  if (applyAnswer(config, 'bin', await askForBin(config.bin || '', 'mvn'))) {
+    return canceledByUser()
+  }
+
+  if (
+    applyAnswer(config, 'javaHome', await askForJavaHome(config.javaHome || ''))
+  ) {
+    return canceledByUser()
+  }
+
+  if (
+    applyAnswer(
+      config,
+      'mavenOpts',
+      await input({
+        message: '(--maven-opts) Enter maven options to pass through',
+        default: config.mavenOpts || '',
+        required: false,
+      }),
+    )
+  ) {
+    return canceledByUser()
+  }
+
+  // Maven only generates Socket facts (no pom path), so always ask the
+  // facts-only options.
+  const factsOptions = await setupFactsOptions(config)
+  if (!factsOptions.ok || factsOptions.data.canceled) {
+    return factsOptions
+  }
+
+  if (applyYesNo(config, 'verbose', await askForVerboseFlag(config.verbose))) {
+    return canceledByUser()
+  }
+
+  return notCanceled()
+}
+
+export async function setupSbt(
+  config: ManifestDefaults<'sbt'>,
+  // See setupGradle's matching parameter for why.
+  { factsOnly = false }: { factsOnly?: boolean } = {},
+): Promise<CResult<{ canceled: boolean }>> {
+  if (applyAnswer(config, 'bin', await askForBin(config.bin || '', 'sbt'))) {
+    return canceledByUser()
+  }
+
+  if (
+    applyAnswer(config, 'javaHome', await askForJavaHome(config.javaHome || ''))
+  ) {
+    return canceledByUser()
+  }
+
+  if (
+    applyAnswer(
+      config,
+      'sbtOpts',
+      await input({
+        message: '(--sbt-opts) Enter sbt options to pass through',
+        default: config.sbtOpts || '',
+        required: false,
+        // validate: async string => bool
+      }),
+    )
+  ) {
+    return canceledByUser()
+  }
+
+  if (!factsOnly) {
+    if (applyYesNo(config, 'facts', await askForFactsFlag(config.facts))) {
+      return canceledByUser()
+    }
+  }
+
+  // Socket facts is the default. The pom output questions (stdout/outfile)
+  // only apply when pom generation (--pom) is explicitly selected; otherwise
+  // ask the facts-only options.
+  if (!factsOnly && config.facts === false) {
+    const stdout = await askForStdout(config.stdout)
+    if (stdout === undefined) {
+      return canceledByUser()
+    } else if (stdout === 'yes') {
+      config.stdout = true
+    } else if (stdout === 'no') {
+      config.stdout = false
+    } else {
+      delete config.stdout
+    }
+
+    if (config.stdout !== true) {
+      const out = await askForOutputFile(config.outfile || 'sbt.pom.xml')
+      if (out === undefined) {
+        return canceledByUser()
+      } else if (out === '-') {
+        config.stdout = true
+      } else {
+        delete config.stdout
+        if (out) {
+          config.outfile = out
+        } else {
+          delete config.outfile
+        }
+      }
+    }
   } else {
-    delete config.verbose
+    const factsOptions = await setupFactsOptions(config)
+    if (!factsOptions.ok || factsOptions.data.canceled) {
+      return factsOptions
+    }
+  }
+
+  if (applyYesNo(config, 'verbose', await askForVerboseFlag(config.verbose))) {
+    return canceledByUser()
   }
 
   return notCanceled()
@@ -443,14 +604,34 @@ async function askForOutputFile(defaultName = ''): Promise<string | undefined> {
   })
 }
 
-async function askForBin(defaultName = ''): Promise<string | undefined> {
+// `defaultName` must be a prior explicit/cascaded value, never the tool's
+// hardcoded fallback (e.g. `mvn`) - pre-filling that would freeze it into
+// socket.json on a bare Enter. `fallbackHint` is informational text only.
+async function askForBin(
+  defaultName = '',
+  fallbackHint = '',
+): Promise<string | undefined> {
   return await input({
     message:
       '(--bin) What should be the command to execute? Usually your build binary.' +
-      (defaultName ? ' (Backspace to leave default)' : ''),
+      (defaultName
+        ? ' (Backspace to leave default)'
+        : fallbackHint
+          ? ` (blank = ${fallbackHint})`
+          : ''),
     default: defaultName,
     required: false,
     // validate: async string => bool
+  })
+}
+
+async function askForJavaHome(defaultName = ''): Promise<string | undefined> {
+  return await input({
+    message:
+      'What JDK should this build tool use? Leave blank to use the JDK already on PATH/JAVA_HOME. Supports $VAR/${VAR}.' +
+      (defaultName ? ' (Backspace to leave default)' : ''),
+    default: defaultName,
+    required: false,
   })
 }
 
@@ -478,6 +659,112 @@ async function askForVerboseFlag(
     ],
     default: current === true ? 'yes' : current === false ? 'no' : '',
   })
+}
+
+async function askForFactsFlag(
+  current: boolean | undefined,
+): Promise<string | undefined> {
+  return await select({
+    message: '(--facts / --pom) Which manifest should this generate?',
+    choices: [
+      {
+        name: 'Socket facts (default)',
+        value: 'yes',
+        description:
+          'Generate a Socket facts file (*.socket.facts.json) describing the resolved dependency graph',
+      },
+      {
+        name: 'pom.xml',
+        value: 'no',
+        description: 'Generate pom.xml manifest files instead (the --pom path)',
+      },
+      {
+        name: '(leave default)',
+        value: '',
+        description: 'Do not store a setting; uses the default (Socket facts)',
+      },
+    ],
+    default: current === true ? 'yes' : current === false ? 'no' : '',
+  })
+}
+
+async function askForIgnoreUnresolvedFlag(
+  current: boolean | undefined,
+): Promise<string | undefined> {
+  return await select({
+    message:
+      '(--ignore-unresolved) Warn on unresolved dependencies instead of failing?',
+    choices: [
+      {
+        name: 'no',
+        value: 'no',
+        description: 'Fail the run when a declared dependency cannot resolve',
+      },
+      {
+        name: 'yes',
+        value: 'yes',
+        description:
+          'Warn and continue; unresolved dependencies are omitted from the facts file',
+      },
+      {
+        name: '(leave default)',
+        value: '',
+        description: 'Do not store a setting for this',
+      },
+    ],
+    default: current === true ? 'yes' : current === false ? 'no' : '',
+  })
+}
+
+// Prompts for the facts-only options every facts generator shares: the config
+// include/exclude filters and --ignore-unresolved. Mutates `config` in place.
+async function setupFactsOptions(
+  config: {
+    excludeConfigs?: string | undefined | null
+    ignoreUnresolved?: boolean | undefined
+    includeConfigs?: string | undefined | null
+  },
+  configNoun = 'config-name',
+): Promise<CResult<{ canceled: boolean }>> {
+  if (
+    applyAnswer(
+      config,
+      'includeConfigs',
+      await input({
+        message: `(--include-configs) Comma-separated ${configNoun} globs to resolve (blank = all)`,
+        default: config.includeConfigs || '',
+        required: false,
+      }),
+    )
+  ) {
+    return canceledByUser()
+  }
+
+  if (
+    applyAnswer(
+      config,
+      'excludeConfigs',
+      await input({
+        message: `(--exclude-configs) Comma-separated ${configNoun} globs to skip (blank = none)`,
+        default: config.excludeConfigs || '',
+        required: false,
+      }),
+    )
+  ) {
+    return canceledByUser()
+  }
+
+  if (
+    applyYesNo(
+      config,
+      'ignoreUnresolved',
+      await askForIgnoreUnresolvedFlag(config.ignoreUnresolved),
+    )
+  ) {
+    return canceledByUser()
+  }
+
+  return notCanceled()
 }
 
 function canceledByUser(): CResult<{ canceled: boolean }> {

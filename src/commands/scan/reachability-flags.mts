@@ -1,41 +1,92 @@
-import constants from '../../constants.mts'
+import { joinAnd } from '@socketsecurity/registry/lib/arrays'
+
+import { COANA_CLI_VERSION } from '../../constants.mts'
+import { cmdFlagValueToArray } from '../../utils/cmd.mts'
+import { isFactsOnlyTypes } from '../../utils/coana.mts'
+import {
+  getReachabilityEcosystemChoices,
+  parseEcosystemChoices,
+} from '../../utils/ecosystem.mts'
+import { InputError } from '../../utils/errors.mts'
+import {
+  FACTS_PURL_TYPES,
+  buildToolLabelsFor,
+} from '../manifest/scripts/build-tool.mts'
 
 import type { MeowFlags } from '../../flags.mts'
+import type { FactsOnlyTypes } from '../../utils/coana.mts'
+
+// Shared prefix so each command can append what the SBOMs are used for, which
+// differs: reachability is optional on `scan create` and always on for
+// `scan reach`.
+export const DYNAMIC_SBOM_INFERENCE_DESCRIPTION =
+  'For Gradle, sbt, Maven and .NET: generate a Socket facts SBOM (produced directly by each package manager) per independent build root, instead of one synthetic root.'
+
+// Not in reachabilityFlags: it applies to a `scan create` without --reach too.
+export const dynamicSbomInferenceEcosystemsFlags: MeowFlags = {
+  dynamicSbomInferenceEcosystems: {
+    type: 'string',
+    isMultiple: true,
+    description: `With --dynamic-sbom-inference: generate Socket facts only for these ecosystems, as either a comma separated value or as multiple flags; the others keep their manifest files as they are. Supported: ${joinAnd(FACTS_PURL_TYPES.map(t => `${t} (${joinAnd(buildToolLabelsFor([t]))})`))}. Defaults to all of them.`,
+  },
+}
+
+export function parseDynamicSbomInferenceFlags(flags: {
+  [flag: string]: unknown
+}): FactsOnlyTypes | undefined {
+  const raw = cmdFlagValueToArray(flags['dynamicSbomInferenceEcosystems'])
+  if (!flags['dynamicSbomInference']) {
+    if (raw.length) {
+      throw new InputError(
+        '--dynamic-sbom-inference-ecosystems requires --dynamic-sbom-inference',
+      )
+    }
+    return undefined
+  }
+  const selected = parseEcosystemChoices(raw, FACTS_PURL_TYPES)
+  return isFactsOnlyTypes(selected) ? selected : FACTS_PURL_TYPES
+}
 
 export const reachabilityFlags: MeowFlags = {
   reachVersion: {
     type: 'string',
-    description: `Override the version of @coana-tech/cli used for reachability analysis. Default: ${constants.ENV.INLINED_SOCKET_CLI_COANA_TECH_CLI_VERSION}.`,
+    description: `Override the version of @coana-tech/cli used for reachability analysis. Default: ${COANA_CLI_VERSION}.`,
+  },
+  reachAdvisories: {
+    type: 'string',
+    isMultiple: true,
+    description:
+      'List of advisories to run reachability analysis for, as GHSA or CVE IDs, either as a comma separated value or as multiple flags. CVE IDs are converted to GHSA IDs through the GitHub API. Vulnerabilities from other advisories get unknown reachability. Defaults to all advisories.',
   },
   reachAnalysisMemoryLimit: {
-    type: 'number',
-    default: 8192,
+    type: 'string',
+    default: '8192',
     description:
-      'The maximum memory in MB to use for the reachability analysis. The default is 8192MB.',
+      'The maximum memory for the reachability analysis as a whole number optionally followed by MB or GB (e.g. 512MB, 8GB). The default is 8GB.',
   },
   reachAnalysisTimeout: {
-    type: 'number',
-    default: 0,
+    type: 'string',
+    default: '',
     description:
-      'Set timeout for the reachability analysis. Split analysis runs may cause the total scan time to exceed this timeout significantly.',
+      'Set the timeout for the reachability analysis as a whole number optionally followed by s, m or h (e.g. 90s, 10m, 1h). Defaults to 10m. Split analysis runs may cause the total scan time to exceed this timeout significantly.',
   },
   reachConcurrency: {
     type: 'number',
     default: 1,
     description:
-      'Set the maximum number of concurrent reachability analysis runs. It is recommended to choose a concurrency level that ensures each analysis run has at least the --reach-analysis-memory-limit amount of memory available. NPM reachability analysis does not support concurrent execution, so the concurrency level is ignored for NPM.',
+      'Set the maximum number of concurrent reachability analysis runs. It is recommended to choose a concurrency level that ensures each analysis run has at least the --reach-analysis-memory-limit amount of memory available.',
   },
   reachContinueOnAnalysisErrors: {
     type: 'boolean',
     default: false,
     description:
-      'Continue reachability analysis when errors occur (timeouts, OOM, parse errors, etc.), falling back to precomputed (Tier 2) results. By default, the CLI halts on analysis errors.',
+      'Continue reachability analysis when errors occur (timeouts, OOM, parse errors, etc.), falling back to precomputed reachability results. By default, the CLI halts on analysis errors.',
   },
   reachContinueOnInstallErrors: {
     type: 'boolean',
     default: false,
     description:
-      'Continue reachability analysis when package installation fails, falling back to precomputed (Tier 2) results. By default, the CLI halts on installation errors.',
+      'Continue reachability analysis when package installation fails, falling back to precomputed reachability results. By default, the CLI halts on installation errors.',
   },
   reachContinueOnMissingLockFiles: {
     type: 'boolean',
@@ -79,6 +130,12 @@ export const reachabilityFlags: MeowFlags = {
     description:
       'Deprecated: Analysis splitting is now disabled by default. This flag is a no-op.',
   },
+  reachDisableDependencyDownloads: {
+    type: 'boolean',
+    default: false,
+    description:
+      "Only analyze dependencies that are already installed (e.g. in the project's .venv, vendor directory or module cache). Missing dependencies count as installation failures.",
+  },
   reachEnableAnalysisSplitting: {
     type: 'boolean',
     default: false,
@@ -88,8 +145,7 @@ export const reachabilityFlags: MeowFlags = {
   reachEcosystems: {
     type: 'string',
     isMultiple: true,
-    description:
-      'List of ecosystems to conduct reachability analysis on, as either a comma separated value or as multiple flags. Defaults to all ecosystems.',
+    description: `List of ecosystems to conduct reachability analysis on, as either a comma separated value or as multiple flags. Supported: ${getReachabilityEcosystemChoices().join(', ')}. Defaults to all supported ecosystems.`,
   },
   reachExcludePaths: {
     type: 'string',
@@ -98,11 +154,24 @@ export const reachabilityFlags: MeowFlags = {
     description:
       'Deprecated: use --exclude-paths instead. List of paths to exclude from reachability analysis, as either a comma separated value or as multiple flags.',
   },
+  reachFallbackToRegularScan: {
+    type: 'boolean',
+    default: false,
+    description:
+      'If reachability analysis fails, continue with a regular SCA scan (without reachability results) instead of halting. By default, the CLI halts on reachability errors.',
+  },
   reachLazyMode: {
     type: 'boolean',
     default: false,
-    description: 'Enable lazy mode for reachability analysis.',
     hidden: true,
+    description:
+      'Deprecated: lazy mode is no longer supported. This flag is a no-op.',
+  },
+  reachRetainFactsFile: {
+    type: 'boolean',
+    default: false,
+    description:
+      'Keep the `.socket.facts.json` reachability report that the analysis writes to the scan directory instead of deleting it after a successful scan. Delete it once inspected: later reachability scans ignore it, but a scan without --reach uploads it as an SBOM carrying stale reachability results.',
   },
   reachSkipCache: {
     type: 'boolean',
@@ -123,6 +192,6 @@ export const excludePathsFlag: MeowFlags = {
     type: 'string',
     isMultiple: true,
     description:
-      'List of glob patterns to exclude from the scan, including SCA/SBOM manifest discovery and (when --reach is enabled) Tier 1 reachability analysis. Patterns are anchored micromatch globs matched relative to the Socket scan root, which is the command working directory (`--cwd` if set), not the reachability target: `tests` matches only `<cwd>/tests`; use `**/tests` to match at any depth. Negation patterns (`!path`) are not supported. Accepts a comma-separated value or multiple flags.',
+      'List of glob patterns to exclude from the scan, including SCA/SBOM manifest discovery and (when --reach is enabled) full application reachability analysis. Patterns are anchored micromatch globs matched relative to the Socket scan root, which is the command working directory (`--cwd` if set), not the reachability target: `tests` matches only `<cwd>/tests`; use `**/tests` to match at any depth. Negation patterns (`!path`) are not supported. Accepts a comma-separated value or multiple flags. An excluded JVM build module or .NET project is not analysed as a project of its own, but where a project that is not excluded depends on it, its code is analysed as part of that project. A build module or project outside the scan root cannot be excluded.',
   },
 }

@@ -1,0 +1,499 @@
+/**
+ * Unit tests for Coana facts-file utilities.
+ *
+ * Test Coverage:
+ * - compressSocketFactsForUpload: swaps .socket.facts.json paths for
+ *   brotli-compressed .br temps, leaves other paths alone, cleans up.
+ * - extractTier1ReachabilityScanId: plain JSON + edge cases.
+ * - extractReachabilityErrors: plain JSON + missing + malformed.
+ * - getFullWorkspacePath: build-root/workspace labelling, including the
+ *   single-root and absent-path cases.
+ * - snapshotSocketFacts: restores overwritten facts files and removes ones
+ *   the analysis created.
+ * - useOnlySocketFactsArtifactsFlags: the facts-only flag per purl type list.
+ *
+ * Related Files:
+ * - utils/coana.mts (implementation)
+ */
+
+import {
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs'
+import { tmpdir } from 'node:os'
+import path from 'node:path'
+import { brotliDecompressSync } from 'node:zlib'
+
+import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+
+import {
+  compressSocketFactsForUpload,
+  extractReachabilityErrors,
+  extractTier1ReachabilityScanId,
+  getFullWorkspacePath,
+  isReachabilityReportPath,
+  isSocketFactsFile,
+  snapshotSocketFacts,
+  useOnlySocketFactsArtifactsFlags,
+} from './coana.mts'
+
+describe('coana facts-file utils', () => {
+  let tmpDir: string
+
+  beforeAll(() => {
+    tmpDir = mkdtempSync(path.join(tmpdir(), 'socket-coana-facts-'))
+  })
+
+  afterAll(() => {
+    rmSync(tmpDir, { recursive: true, force: true })
+  })
+
+  function writePlain(name: string, body: unknown): string {
+    const filePath = path.join(tmpDir, name)
+    writeFileSync(filePath, JSON.stringify(body))
+    return filePath
+  }
+
+  describe('isSocketFactsFile', () => {
+    it.each([
+      '.socket.facts.json',
+      'a/pom.xml.socket.facts.json',
+      'gradle.socket.facts.json',
+      'Foo.sln.SOCKET.FACTS.JSON',
+    ])('matches %s', p => {
+      expect(isSocketFactsFile(p)).toBe(true)
+    })
+    it.each([
+      'socket.facts.json',
+      '.socket.facts.json.br',
+      'pom.xml',
+      'a/.socket.facts.json/pom.xml',
+    ])('rejects %s', p => {
+      expect(isSocketFactsFile(p)).toBe(false)
+    })
+  })
+
+  describe('isReachabilityReportPath', () => {
+    const options = { cwd: '/repo', outputPath: 'out/report.json' }
+    it.each([
+      '.socket.facts.json',
+      'a/.SOCKET.FACTS.JSON',
+      '/repo/out/report.json',
+      'out/report.json',
+    ])('matches %s', p => {
+      expect(isReachabilityReportPath(p, options)).toBe(true)
+    })
+    it.each([
+      'pom.xml.socket.facts.json',
+      'gradle.socket.facts.json',
+      'report.json',
+    ])('rejects %s', p => {
+      expect(isReachabilityReportPath(p, options)).toBe(false)
+    })
+  })
+
+  describe('compressSocketFactsForUpload', () => {
+    it('writes brotli .br as a sibling of the source file', async () => {
+      const wrapDir = mkdtempSync(path.join(tmpdir(), 'socket-coana-wrap-'))
+      const inputPath = path.join(wrapDir, '.socket.facts.json')
+      const payload = { tier1ReachabilityScanId: 'compress-test', a: 1, b: 2 }
+      writeFileSync(inputPath, JSON.stringify(payload))
+
+      try {
+        const result = await compressSocketFactsForUpload([inputPath])
+        const swappedPath = result.paths[0]!
+
+        expect(result.paths).toHaveLength(1)
+        expect(swappedPath).toBe(`${inputPath}.br`)
+        expect(existsSync(swappedPath)).toBe(true)
+        // The sibling file is real brotli that round-trips to the original
+        // JSON.
+        const roundTripped = brotliDecompressSync(
+          readFileSync(swappedPath),
+        ).toString('utf8')
+        expect(JSON.parse(roundTripped)).toEqual(payload)
+
+        // Cleanup removes the sibling .br file but leaves the source intact.
+        await result.cleanup()
+        expect(existsSync(swappedPath)).toBe(false)
+        expect(existsSync(inputPath)).toBe(true)
+      } finally {
+        rmSync(wrapDir, { recursive: true, force: true })
+      }
+    })
+
+    it('leaves non-facts paths unchanged', async () => {
+      const wrapDir = mkdtempSync(path.join(tmpdir(), 'socket-coana-wrap-'))
+      const lock = path.join(wrapDir, 'package-lock.json')
+      const pkg = path.join(wrapDir, 'package.json')
+      writeFileSync(lock, '{}')
+      writeFileSync(pkg, '{}')
+
+      const result = await compressSocketFactsForUpload([lock, pkg])
+      try {
+        expect(result.paths).toEqual([lock, pkg])
+      } finally {
+        await result.cleanup()
+        rmSync(wrapDir, { recursive: true, force: true })
+      }
+    })
+
+    it('uploads a named facts file uncompressed', async () => {
+      const wrapDir = mkdtempSync(path.join(tmpdir(), 'socket-coana-wrap-'))
+      const facts = path.join(wrapDir, 'pom.xml.socket.facts.json')
+      writeFileSync(facts, '{}')
+
+      const result = await compressSocketFactsForUpload([facts])
+      try {
+        expect(result.paths).toEqual([facts])
+        expect(existsSync(`${facts}.br`)).toBe(false)
+      } finally {
+        await result.cleanup()
+        rmSync(wrapDir, { recursive: true, force: true })
+      }
+    })
+
+    it('leaves a missing .socket.facts.json path unchanged', async () => {
+      const wrapDir = mkdtempSync(path.join(tmpdir(), 'socket-coana-wrap-'))
+      const missingFacts = path.join(wrapDir, '.socket.facts.json')
+      // Note: no writeFileSync — file does not exist.
+
+      const result = await compressSocketFactsForUpload([missingFacts])
+      try {
+        expect(result.paths).toEqual([missingFacts])
+      } finally {
+        await result.cleanup()
+        rmSync(wrapDir, { recursive: true, force: true })
+      }
+    })
+
+    it('mixes facts and non-facts entries correctly', async () => {
+      const wrapDir = mkdtempSync(path.join(tmpdir(), 'socket-coana-wrap-'))
+      const facts = path.join(wrapDir, '.socket.facts.json')
+      const lock = path.join(wrapDir, 'package-lock.json')
+      writeFileSync(facts, JSON.stringify({ tier1ReachabilityScanId: 'mix' }))
+      writeFileSync(lock, '{"name":"x"}')
+
+      const result = await compressSocketFactsForUpload([lock, facts])
+      try {
+        expect(result.paths[0]).toBe(lock)
+        expect(result.paths[1]).toBe(`${facts}.br`)
+        const roundTripped = JSON.parse(
+          brotliDecompressSync(readFileSync(result.paths[1]!)).toString('utf8'),
+        )
+        expect(roundTripped.tier1ReachabilityScanId).toBe('mix')
+      } finally {
+        await result.cleanup()
+        rmSync(wrapDir, { recursive: true, force: true })
+      }
+    })
+
+    it('cleanup is idempotent (safe to call twice)', async () => {
+      const wrapDir = mkdtempSync(path.join(tmpdir(), 'socket-coana-wrap-'))
+      const facts = path.join(wrapDir, '.socket.facts.json')
+      writeFileSync(facts, JSON.stringify({ tier1ReachabilityScanId: 'idem' }))
+
+      const result = await compressSocketFactsForUpload([facts])
+      await result.cleanup()
+      await expect(result.cleanup()).resolves.not.toThrow()
+      rmSync(wrapDir, { recursive: true, force: true })
+    })
+
+    it('removes partial .br siblings if compression fails mid-batch', async () => {
+      // Two facts files; B's `.br` destination is pre-occupied by a
+      // directory so `createWriteStream` open() fails with EISDIR. The
+      // whole batch rejects, but A's `.br` must not be orphaned.
+      const { mkdirSync } = await import('node:fs')
+      const wrapDirA = mkdtempSync(path.join(tmpdir(), 'socket-coana-wrap-a-'))
+      const wrapDirB = mkdtempSync(path.join(tmpdir(), 'socket-coana-wrap-b-'))
+      const factsA = path.join(wrapDirA, '.socket.facts.json')
+      const factsB = path.join(wrapDirB, '.socket.facts.json')
+      writeFileSync(factsA, JSON.stringify({ tier1ReachabilityScanId: 'A' }))
+      writeFileSync(factsB, JSON.stringify({ tier1ReachabilityScanId: 'B' }))
+      mkdirSync(`${factsB}.br`, { recursive: true })
+
+      try {
+        await expect(
+          compressSocketFactsForUpload([factsA, factsB]),
+        ).rejects.toThrow()
+        // A's sibling must not be on disk; sources must still exist.
+        expect(existsSync(`${factsA}.br`)).toBe(false)
+        expect(existsSync(factsA)).toBe(true)
+        expect(existsSync(factsB)).toBe(true)
+      } finally {
+        rmSync(wrapDirA, { recursive: true, force: true })
+        rmSync(wrapDirB, { recursive: true, force: true })
+      }
+    })
+  })
+
+  describe('extractTier1ReachabilityScanId', () => {
+    it('reads scan ID from plain JSON file', () => {
+      const file = writePlain('plain-id.json', {
+        tier1ReachabilityScanId: 'scan-123',
+      })
+
+      expect(extractTier1ReachabilityScanId(file)).toBe('scan-123')
+    })
+
+    it('returns undefined for missing file', () => {
+      expect(
+        extractTier1ReachabilityScanId(path.join(tmpDir, 'missing.json')),
+      ).toBeUndefined()
+    })
+
+    it('returns undefined when tier1ReachabilityScanId is missing', () => {
+      const file = writePlain('missing-field.json', { otherField: 'value' })
+
+      expect(extractTier1ReachabilityScanId(file)).toBeUndefined()
+    })
+
+    it('returns undefined for null scan ID', () => {
+      const file = writePlain('null-id.json', { tier1ReachabilityScanId: null })
+
+      expect(extractTier1ReachabilityScanId(file)).toBeUndefined()
+    })
+
+    it('returns undefined for empty / whitespace scan ID', () => {
+      const blank = writePlain('blank-id.json', {
+        tier1ReachabilityScanId: '   ',
+      })
+      const empty = writePlain('empty-id.json', {
+        tier1ReachabilityScanId: '',
+      })
+
+      expect(extractTier1ReachabilityScanId(blank)).toBeUndefined()
+      expect(extractTier1ReachabilityScanId(empty)).toBeUndefined()
+    })
+
+    it('trims whitespace from scan ID', () => {
+      const file = writePlain('padded-id.json', {
+        tier1ReachabilityScanId: '  scan-456  ',
+      })
+
+      expect(extractTier1ReachabilityScanId(file)).toBe('scan-456')
+    })
+
+    it('coerces numeric scan ID to string', () => {
+      const file = writePlain('numeric-id.json', {
+        tier1ReachabilityScanId: 12345,
+      })
+
+      expect(extractTier1ReachabilityScanId(file)).toBe('12345')
+    })
+  })
+
+  describe('extractReachabilityErrors', () => {
+    const errorComponentsBody = {
+      components: [
+        {
+          name: 'lodash',
+          version: '4.17.21',
+          reachability: [
+            {
+              ghsa_id: 'GHSA-aaaa-bbbb-cccc',
+              reachability: [
+                {
+                  type: 'error',
+                  subprojectPath: '.',
+                  workspacePath: 'packages/web',
+                },
+                {
+                  type: 'reachable',
+                  subprojectPath: '.',
+                  workspacePath: 'packages/api',
+                },
+              ],
+            },
+          ],
+        },
+        {
+          name: 'axios',
+          version: '1.4.0',
+          reachability: [
+            {
+              ghsa_id: 'GHSA-xxxx-yyyy-zzzz',
+              reachability: [
+                {
+                  type: 'error',
+                  subprojectPath: 'services/gateway',
+                  workspacePath: 'packages/api',
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    }
+
+    const expectedErrors = [
+      {
+        componentName: 'lodash',
+        componentVersion: '4.17.21',
+        ghsaId: 'GHSA-aaaa-bbbb-cccc',
+        subprojectPath: '.',
+        workspacePath: 'packages/web',
+      },
+      {
+        componentName: 'axios',
+        componentVersion: '1.4.0',
+        ghsaId: 'GHSA-xxxx-yyyy-zzzz',
+        subprojectPath: 'services/gateway',
+        workspacePath: 'packages/api',
+      },
+    ]
+
+    it('extracts errors from plain JSON', () => {
+      const file = writePlain('errors-plain.json', errorComponentsBody)
+
+      expect(extractReachabilityErrors(file)).toEqual(expectedErrors)
+    })
+
+    it('returns empty array for missing file', () => {
+      expect(
+        extractReachabilityErrors(path.join(tmpDir, 'missing-errors.json')),
+      ).toEqual([])
+    })
+
+    it('returns empty array when components is missing', () => {
+      const file = writePlain('errors-no-components.json', { other: true })
+
+      expect(extractReachabilityErrors(file)).toEqual([])
+    })
+
+    it('skips components with no reachability arrays', () => {
+      const file = writePlain('errors-skip.json', {
+        components: [
+          { name: 'just-name', version: '1.0.0' },
+          {
+            name: 'no-inner',
+            version: '1.0.0',
+            reachability: [{ ghsa_id: 'GHSA-1' }],
+          },
+        ],
+      })
+
+      expect(extractReachabilityErrors(file)).toEqual([])
+    })
+  })
+
+  describe('getFullWorkspacePath', () => {
+    it('joins a build root with the workspace inside it', () => {
+      expect(getFullWorkspacePath('services/gateway', 'packages/api')).toBe(
+        'services/gateway/packages/api',
+      )
+    })
+
+    it('uses the workspace alone for a single-root repo', () => {
+      expect(getFullWorkspacePath('.', 'packages/api')).toBe('packages/api')
+    })
+
+    it('uses the build root alone when it holds no nested workspace', () => {
+      expect(getFullWorkspacePath('services/gateway', '.')).toBe(
+        'services/gateway',
+      )
+    })
+
+    it('falls back to the root when neither path is meaningful', () => {
+      expect(getFullWorkspacePath('.', '.')).toBe('.')
+      expect(getFullWorkspacePath('', '')).toBe('.')
+    })
+
+    it('ignores an absent path from an older Coana release', () => {
+      expect(getFullWorkspacePath('', 'packages/api')).toBe('packages/api')
+      expect(getFullWorkspacePath('services/gateway', '')).toBe(
+        'services/gateway',
+      )
+    })
+  })
+  describe('snapshotSocketFacts', () => {
+    it('restores a facts file the analysis overwrote in place', async () => {
+      const wrapDir = mkdtempSync(path.join(tmpdir(), 'socket-coana-snap-'))
+      const factsPath = path.join(wrapDir, '.socket.facts.json')
+      writeFileSync(factsPath, JSON.stringify({ producer: 'gradle' }))
+
+      try {
+        const snapshot = await snapshotSocketFacts(['.socket.facts.json'], {
+          cwd: wrapDir,
+          outputPath: '.socket.facts.json',
+          tmpDir: wrapDir,
+        })
+
+        writeFileSync(factsPath, '{"partial": true')
+
+        await snapshot.restore()
+
+        expect(JSON.parse(readFileSync(factsPath, 'utf8'))).toEqual({
+          producer: 'gradle',
+        })
+      } finally {
+        rmSync(wrapDir, { recursive: true, force: true })
+      }
+    })
+
+    it('removes an output file that did not exist before the analysis', async () => {
+      const wrapDir = mkdtempSync(path.join(tmpdir(), 'socket-coana-snap-'))
+      const factsPath = path.join(wrapDir, '.socket.facts.json')
+
+      try {
+        const snapshot = await snapshotSocketFacts([], {
+          cwd: wrapDir,
+          outputPath: '.socket.facts.json',
+          tmpDir: wrapDir,
+        })
+
+        writeFileSync(factsPath, JSON.stringify({ coana: 'partial' }))
+
+        await snapshot.restore()
+
+        expect(existsSync(factsPath)).toBe(false)
+      } finally {
+        rmSync(wrapDir, { recursive: true, force: true })
+      }
+    })
+
+    it('leaves non-facts paths alone', async () => {
+      const wrapDir = mkdtempSync(path.join(tmpdir(), 'socket-coana-snap-'))
+      const manifestPath = path.join(wrapDir, 'package.json')
+      writeFileSync(manifestPath, JSON.stringify({ name: 'pkg' }))
+
+      try {
+        const snapshot = await snapshotSocketFacts(['package.json'], {
+          cwd: wrapDir,
+          outputPath: '.socket.facts.json',
+          tmpDir: wrapDir,
+        })
+
+        writeFileSync(manifestPath, JSON.stringify({ name: 'changed' }))
+
+        await snapshot.restore()
+
+        expect(JSON.parse(readFileSync(manifestPath, 'utf8'))).toEqual({
+          name: 'changed',
+        })
+      } finally {
+        rmSync(wrapDir, { recursive: true, force: true })
+      }
+    })
+  })
+})
+
+describe('useOnlySocketFactsArtifactsFlags', () => {
+  it.for([
+    // Maven alone keeps the flag Coana releases before 15.14.1 also know.
+    { types: ['maven'], expected: ['--maven-use-only-socket-facts'] },
+    {
+      types: ['nuget', 'maven'],
+      expected: ['--use-only-socket-facts-artifacts', 'maven,nuget'],
+    },
+    {
+      types: ['nuget'],
+      expected: ['--use-only-socket-facts-artifacts', 'nuget'],
+    },
+  ] as const)('$types -> $expected', ({ expected, types }) => {
+    expect(useOnlySocketFactsArtifactsFlags(types)).toEqual(expected)
+  })
+})

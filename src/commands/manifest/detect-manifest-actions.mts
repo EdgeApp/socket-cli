@@ -1,11 +1,12 @@
 // The point here is to attempt to detect the various supported manifest files
 // the CLI can generate. This would be environments that we can't do server side
 
-import { existsSync } from 'node:fs'
+import { existsSync, readdirSync } from 'node:fs'
 import path from 'node:path'
 
 import { debugLog } from '@socketsecurity/registry/lib/debug'
 
+import { compareEntryFiles, isBuildFile } from './discover-manifest-roots.mts'
 import {
   ENVIRONMENT_YAML,
   ENVIRONMENT_YML,
@@ -15,11 +16,42 @@ import {
 import type { SocketJson } from '../../utils/socket-json.mts'
 
 export interface GeneratableManifests {
+  bazel: boolean
   cdxgen: boolean
   count: number
   conda: boolean
+  // The Conda file found at cwd, empty when there is none.
+  condaFile: string
+  dotnet: boolean
   gradle: boolean
+  maven: boolean
   sbt: boolean
+}
+
+// Conda reads both spellings of the environment file.
+export function findCondaFile(cwd: string): string {
+  if (existsSync(path.join(cwd, ENVIRONMENT_YML))) {
+    return ENVIRONMENT_YML
+  }
+  if (existsSync(path.join(cwd, ENVIRONMENT_YAML))) {
+    return ENVIRONMENT_YAML
+  }
+  return ''
+}
+
+// The solutions and projects at the top of `cwd`, in the order builds there
+// run.
+export function findDotnetEntries(cwd: string): string[] {
+  let entries
+  try {
+    entries = readdirSync(cwd, { withFileTypes: true })
+  } catch {
+    return []
+  }
+  return entries
+    .filter(e => e.isFile() && isBuildFile('dotnet', e.name))
+    .map(e => e.name)
+    .sort((a, b) => compareEntryFiles('dotnet', a, b))
 }
 
 export async function detectManifestActions(
@@ -29,11 +61,30 @@ export async function detectManifestActions(
   cwd = process.cwd(),
 ): Promise<GeneratableManifests> {
   const output = {
+    bazel: false,
     cdxgen: false, // TODO
     count: 0,
     conda: false,
+    condaFile: '',
+    dotnet: false,
     gradle: false,
+    maven: false,
     sbt: false,
+  }
+
+  if (sockJson?.defaults?.manifest?.bazel?.disabled) {
+    debugLog(
+      'notice',
+      `[DEBUG] - bazel auto-detection is disabled in ${SOCKET_JSON}`,
+    )
+  } else if (
+    existsSync(path.join(cwd, 'MODULE.bazel')) ||
+    existsSync(path.join(cwd, 'WORKSPACE')) ||
+    existsSync(path.join(cwd, 'WORKSPACE.bazel'))
+  ) {
+    debugLog('notice', '[DEBUG] - Detected a Bazel workspace')
+    output.bazel = true
+    output.count += 1
   }
 
   if (sockJson?.defaults?.manifest?.sbt?.disabled) {
@@ -53,9 +104,38 @@ export async function detectManifestActions(
       'notice',
       `[DEBUG] - gradle auto-detection is disabled in ${SOCKET_JSON}`,
     )
-  } else if (existsSync(path.join(cwd, 'gradlew'))) {
+  } else if (
+    existsSync(path.join(cwd, 'build.gradle')) ||
+    existsSync(path.join(cwd, 'build.gradle.kts')) ||
+    existsSync(path.join(cwd, 'settings.gradle')) ||
+    existsSync(path.join(cwd, 'settings.gradle.kts'))
+  ) {
+    // Detect by build descriptor, not the `gradlew` wrapper (a project can build via
+    // `gradle` on PATH). `settings.gradle(.kts)` covers Kotlin-DSL roots with no root build script.
     debugLog('notice', '[DEBUG] - Detected a gradle build file')
     output.gradle = true
+    output.count += 1
+  }
+
+  if (sockJson?.defaults?.manifest?.maven?.disabled) {
+    debugLog(
+      'notice',
+      `[DEBUG] - maven auto-detection is disabled in ${SOCKET_JSON}`,
+    )
+  } else if (existsSync(path.join(cwd, 'pom.xml'))) {
+    debugLog('notice', '[DEBUG] - Detected a Maven pom.xml build file')
+    output.maven = true
+    output.count += 1
+  }
+
+  if (sockJson?.defaults?.manifest?.dotnet?.disabled) {
+    debugLog(
+      'notice',
+      `[DEBUG] - dotnet auto-detection is disabled in ${SOCKET_JSON}`,
+    )
+  } else if (findDotnetEntries(cwd).length) {
+    debugLog('notice', '[DEBUG] - Detected a .NET solution or project file')
+    output.dotnet = true
     output.count += 1
   }
 
@@ -65,13 +145,11 @@ export async function detectManifestActions(
       `[DEBUG] - conda auto-detection is disabled in ${SOCKET_JSON}`,
     )
   } else {
-    const envyml = path.join(cwd, ENVIRONMENT_YML)
-    const hasEnvyml = existsSync(envyml)
-    const envyaml = path.join(cwd, ENVIRONMENT_YAML)
-    const hasEnvyaml = !hasEnvyml && existsSync(envyaml)
-    if (hasEnvyml || hasEnvyaml) {
-      debugLog('notice', '[DEBUG] - Detected an environment.yml Conda file')
+    const condaFile = findCondaFile(cwd)
+    if (condaFile) {
+      debugLog('notice', `[DEBUG] - Detected the Conda file ${condaFile}`)
       output.conda = true
+      output.condaFile = condaFile
       output.count += 1
     }
   }

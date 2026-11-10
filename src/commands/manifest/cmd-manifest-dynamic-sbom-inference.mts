@@ -1,0 +1,148 @@
+import path from 'node:path'
+
+import { logger } from '@socketsecurity/registry/lib/logger'
+
+import { handleManifestDynamicSbomInference } from './handle-manifest-dynamic-sbom-inference.mts'
+import { excludePathsFlag } from './manifest-flags.mts'
+import constants, { FLAG_JSON, FLAG_MARKDOWN } from '../../constants.mts'
+import { commonFlags, outputFlags } from '../../flags.mts'
+import { checkCommandInput } from '../../utils/check-input.mts'
+import { cmdFlagValueToArray } from '../../utils/cmd.mts'
+import { getOutputKind } from '../../utils/get-output-kind.mts'
+import { meowOrExit } from '../../utils/meow-with-subcommands.mts'
+import { getFlagListOutput } from '../../utils/output-formatting.mts'
+import { assertValidExcludePaths } from '../scan/exclude-paths.mts'
+
+import type {
+  CliCommandConfig,
+  CliCommandContext,
+} from '../../utils/meow-with-subcommands.mts'
+
+const config: CliCommandConfig = {
+  commandName: 'dynamic-sbom-inference',
+  description:
+    'Recursively discover .NET, Gradle, Maven, and sbt build roots and generate a Socket facts SBOM for each',
+  hidden: false,
+  flags: {
+    ...commonFlags,
+    ...outputFlags,
+    ...excludePathsFlag,
+    ignoreUnresolved: {
+      type: 'boolean',
+      description:
+        "Warn on unresolved dependencies instead of failing the run (unresolved deps are not emitted to the facts files); overrides each build's socket.json setting",
+    },
+    verbose: {
+      type: 'boolean',
+      default: false,
+      description: 'Print debug messages',
+    },
+  },
+  help: (command, config) => `
+    Usage
+      $ ${command} [options] [CWD=.]
+
+    Recursively walks CWD, discovers independent gradle, sbt, and maven build
+    roots, and generates a Socket facts SBOM for each
+    (pom.xml.socket.facts.json, gradle.socket.facts.json, or
+    sbt.socket.facts.json, so builds sharing a directory never overwrite each
+    other),
+    skipping build roots whose build file a parent build already reports for
+    one of its subprojects. Unlike \`socket manifest auto\`, this looks beyond
+    CWD itself.
+
+    Options
+      ${getFlagListOutput(config.flags)}
+
+    Examples
+
+      $ ${command}
+      $ ${command} ./monorepo
+  `,
+}
+
+export const cmdManifestDynamicSbomInference = {
+  description: config.description,
+  hidden: config.hidden,
+  run,
+}
+
+async function run(
+  argv: string[] | readonly string[],
+  importMeta: ImportMeta,
+  { parentName }: CliCommandContext,
+): Promise<void> {
+  const cli = meowOrExit({
+    argv,
+    config,
+    importMeta,
+    parentName,
+  })
+
+  const {
+    dryRun,
+    ignoreUnresolved,
+    json,
+    markdown,
+    verbose: verboseFlag,
+  } = cli.flags as {
+    dryRun: boolean
+    ignoreUnresolved: boolean | undefined
+    json: boolean
+    markdown: boolean
+    verbose: boolean | undefined
+  }
+  const verbose = !!verboseFlag
+
+  let [cwd = '.'] = cli.input
+  // Note: path.resolve vs .join:
+  // If given path is absolute then cwd should not affect it.
+  cwd = path.resolve(process.cwd(), cwd)
+
+  // This debug block prints to stdout; --json's payload does too, so skip it
+  // here (unlike the other manifest commands, this one supports --json).
+  if (verbose && !json) {
+    logger.group('- ', parentName, config.commandName, ':')
+    logger.group('- flags:', cli.flags)
+    logger.groupEnd()
+    logger.log('- target:', cwd)
+    logger.groupEnd()
+  }
+
+  const outputKind = getOutputKind(json, markdown)
+
+  const wasValidInput = checkCommandInput(
+    outputKind,
+    {
+      nook: true,
+      test: cli.input.length <= 1,
+      message: 'Can only accept one DIR (make sure to escape spaces!)',
+      fail: `received ${cli.input.length}`,
+    },
+    {
+      nook: true,
+      test: !json || !markdown,
+      message: `The \`${FLAG_JSON}\` and \`${FLAG_MARKDOWN}\` flags can not be used at the same time`,
+      fail: 'bad',
+    },
+  )
+  if (!wasValidInput) {
+    return
+  }
+
+  const excludePaths = cmdFlagValueToArray(cli.flags['excludePaths'])
+  assertValidExcludePaths(excludePaths)
+
+  if (dryRun) {
+    logger.log(constants.DRY_RUN_BAILING_NOW)
+    return
+  }
+
+  await handleManifestDynamicSbomInference({
+    cwd,
+    excludePaths,
+    ignoreUnresolved,
+    outputKind,
+    verbose,
+  })
+}

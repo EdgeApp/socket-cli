@@ -4,13 +4,12 @@
  *
  * Key Functions:
  * - spawnCdxgenDlx: Execute CycloneDX generator via dlx
- * - spawnCoanaDlx: Execute Coana CLI tool via dlx
  * - spawnDlx: Execute packages using dlx-style commands
  * - spawnSynpDlx: Execute Synp converter via dlx
  *
  * Package Manager Detection:
  * - Auto-detects npm, pnpm, or yarn based on lockfiles
- * - Supports force-refresh and silent execution modes
+ * - Supports silent execution mode
  *
  * Integration:
  * - Works with shadow binaries for security scanning
@@ -21,9 +20,7 @@
 import { createRequire } from 'node:module'
 
 import { getOwn } from '@socketsecurity/registry/lib/objects'
-import { spawn } from '@socketsecurity/registry/lib/spawn'
 
-import { getDefaultOrgSlug } from '../commands/ci/fetch-default-org-slug.mts'
 import constants, {
   FLAG_QUIET,
   FLAG_SILENT,
@@ -31,13 +28,10 @@ import constants, {
   PNPM,
   YARN,
 } from '../constants.mts'
-import { getErrorCause } from './errors.mts'
 import { findUp } from './fs.mts'
-import { getDefaultApiToken, getDefaultProxyUrl } from './sdk.mts'
 import { isYarnBerry } from './yarn-version.mts'
 
 import type { ShadowBinOptions, ShadowBinResult } from '../shadow/npm-base.mts'
-import type { CResult } from '../types.mts'
 import type { SpawnExtra } from '@socketsecurity/registry/lib/spawn'
 
 const require = createRequire(import.meta.url)
@@ -45,7 +39,6 @@ const require = createRequire(import.meta.url)
 const { PACKAGE_LOCK_JSON, PNPM_LOCK_YAML, YARN_LOCK } = constants
 
 export type DlxOptions = ShadowBinOptions & {
-  force?: boolean | undefined
   agent?: 'npm' | 'pnpm' | 'yarn' | undefined
   silent?: boolean | undefined
 }
@@ -56,15 +49,8 @@ export type DlxPackageSpec = {
 }
 
 /**
- * Regex to check if a version string contains range operators.
- * Matches any version with range operators: ~, ^, >, <, =, x, X, *, spaces, or ||.
- */
-const rangeOperatorsRegExp = /[~^><=xX* ]|\|\|/
-
-/**
  * Spawns a package using dlx-style execution (npx/pnpm dlx/yarn dlx).
  * Automatically detects the appropriate package manager if not specified.
- * Uses force/update flags to ensure the latest version within the range is fetched.
  */
 export async function spawnDlx(
   packageSpec: DlxPackageSpec,
@@ -72,15 +58,7 @@ export async function spawnDlx(
   options?: DlxOptions | undefined,
   spawnExtra?: SpawnExtra | undefined,
 ): Promise<ShadowBinResult> {
-  // If version is not pinned exactly, default to force and silent for better UX.
-  const isNotPinned = rangeOperatorsRegExp.test(packageSpec.version)
-
-  const {
-    agent,
-    force = false,
-    silent = isNotPinned,
-    ...shadowOptions
-  } = options ?? {}
+  const { agent, silent = false, ...shadowOptions } = options ?? {}
 
   let finalShadowOptions = shadowOptions
 
@@ -121,19 +99,20 @@ export async function spawnDlx(
       spawnArgs.push(FLAG_SILENT)
     }
     spawnArgs.push('dlx')
-    if (force) {
-      // For pnpm, set dlx-cache-max-age to 0 via env to force fresh download.
-      // This ensures we always get the latest version within the range.
-      finalShadowOptions = {
-        ...finalShadowOptions,
-        env: {
-          ...getOwn(finalShadowOptions, 'env'),
-          // Set dlx cache max age to 0 minutes to bypass cache.
-          // The npm_config_ prefix is how pnpm reads config from environment variables.
-          // See: https://pnpm.io/npmrc#settings
-          npm_config_dlx_cache_max_age: '0',
-        },
-      }
+    // Never let the target project's `.pnpmfile.cjs` hooks run while we launch
+    // a third-party tool via `pnpm dlx`. In a pnpm workspace root, `pnpm dlx`
+    // loads the cwd's `.pnpmfile.cjs`, so a broken hook there (e.g. a `require`
+    // of an unresolved Git LFS pointer) crashes the launcher with a bare exit
+    // code before our tool ever starts. The dlx tool installs into an isolated
+    // store, so the project's install hooks are irrelevant to it. pnpm honors
+    // this only as a config setting, not as a `dlx` CLI flag, so it must be set
+    // via the npm_config_ env var. See: https://pnpm.io/npmrc#settings
+    finalShadowOptions = {
+      ...finalShadowOptions,
+      env: {
+        ...getOwn(finalShadowOptions, 'env'),
+        npm_config_ignore_pnpmfile: 'true',
+      },
     }
     spawnArgs.push(packageString, ...args)
 
@@ -163,10 +142,6 @@ export async function spawnDlx(
     // Use npm exec/npx.
     // For consistency, we'll use npx which is more commonly used for one-off execution.
     spawnArgs = ['--yes']
-    if (force) {
-      // Use --force to bypass cache and get latest within range.
-      spawnArgs.push('--force')
-    }
     if (silent) {
       spawnArgs.push(FLAG_SILENT)
     }
@@ -174,140 +149,6 @@ export async function spawnDlx(
 
     const shadowNpxBin = /*@__PURE__*/ require(constants.shadowNpxBinPath)
     return await shadowNpxBin(spawnArgs, finalShadowOptions, spawnExtra)
-  }
-}
-
-export type CoanaDlxOptions = DlxOptions & {
-  coanaVersion?: string | undefined
-}
-
-/**
- * Helper to spawn coana with dlx.
- * Automatically uses force and silent when version is not pinned exactly.
- * Returns a CResult with stdout extraction for backward compatibility.
- *
- * If SOCKET_CLI_COANA_LOCAL_PATH environment variable is set, uses the local
- * Coana CLI at that path instead of downloading from npm.
- */
-export async function spawnCoanaDlx(
-  args: string[] | readonly string[],
-  orgSlug?: string,
-  options?: CoanaDlxOptions | undefined,
-  spawnExtra?: SpawnExtra | undefined,
-): Promise<CResult<string>> {
-  const {
-    coanaVersion,
-    env: spawnEnv,
-    ipc,
-    ...dlxOptions
-  } = {
-    __proto__: null,
-    ...options,
-  } as CoanaDlxOptions
-
-  const mixinsEnv: Record<string, string> = {
-    SOCKET_CLI_VERSION: constants.ENV.INLINED_SOCKET_CLI_VERSION,
-  }
-  const defaultApiToken = getDefaultApiToken()
-  if (defaultApiToken) {
-    mixinsEnv['SOCKET_CLI_API_TOKEN'] = defaultApiToken
-  }
-
-  if (orgSlug) {
-    mixinsEnv['SOCKET_ORG_SLUG'] = orgSlug
-  } else {
-    const orgSlugCResult = await getDefaultOrgSlug()
-    if (orgSlugCResult.ok) {
-      mixinsEnv['SOCKET_ORG_SLUG'] = orgSlugCResult.data
-    }
-  }
-
-  const proxyUrl = getDefaultProxyUrl()
-  if (proxyUrl) {
-    mixinsEnv['SOCKET_CLI_API_PROXY'] = proxyUrl
-  }
-
-  try {
-    const localCoanaPath = process.env['SOCKET_CLI_COANA_LOCAL_PATH']
-    // Use local Coana CLI if path is provided.
-    if (localCoanaPath) {
-      const isBinary =
-        !localCoanaPath.endsWith('.js') && !localCoanaPath.endsWith('.mjs')
-
-      const finalEnv = {
-        ...process.env,
-        ...constants.processEnv,
-        ...mixinsEnv,
-        ...spawnEnv,
-      }
-
-      const spawnArgs = isBinary ? args : [localCoanaPath, ...args]
-      const spawnResult = await spawn(
-        isBinary ? localCoanaPath : 'node',
-        spawnArgs,
-        {
-          cwd: dlxOptions.cwd,
-          env: finalEnv,
-          stdio: spawnExtra?.['stdio'] || 'inherit',
-        },
-      )
-
-      return { ok: true, data: spawnResult.stdout }
-    }
-
-    // Use npm/dlx version.
-    const result = await spawnDlx(
-      {
-        name: '@coana-tech/cli',
-        version:
-          coanaVersion ||
-          constants.ENV.INLINED_SOCKET_CLI_COANA_TECH_CLI_VERSION,
-      },
-      args,
-      {
-        force: true,
-        silent: true,
-        ...dlxOptions,
-        env: {
-          ...process.env,
-          ...constants.processEnv,
-          ...mixinsEnv,
-          ...spawnEnv,
-        },
-        ipc: {
-          [constants.SOCKET_CLI_SHADOW_ACCEPT_RISKS]: true,
-          [constants.SOCKET_CLI_SHADOW_API_TOKEN]:
-            constants.SOCKET_PUBLIC_API_TOKEN,
-          [constants.SOCKET_CLI_SHADOW_SILENT]: true,
-          ...ipc,
-        },
-      },
-      spawnExtra,
-    )
-    const output = await result.spawnPromise
-    return { ok: true, data: output.stdout }
-  } catch (e) {
-    const stderr = (e as any)?.stderr
-    const exitCode = (e as any)?.code
-    const signal = (e as any)?.signal
-    const cause = getErrorCause(e)
-    // Build a descriptive error message with exit code and signal details.
-    const details: string[] = []
-    if (typeof exitCode === 'number') {
-      details.push(`exit code ${exitCode}`)
-    }
-    if (signal) {
-      details.push(`signal ${signal}`)
-    }
-    const detailSuffix = details.length ? ` (${details.join(', ')})` : ''
-    const message = stderr
-      ? `Coana command failed${detailSuffix}: ${stderr}`
-      : `Coana command failed${detailSuffix}: ${cause}`
-    return {
-      ok: false,
-      data: e,
-      message,
-    }
   }
 }
 
@@ -325,7 +166,7 @@ export async function spawnCdxgenDlx(
       version: constants.ENV.INLINED_SOCKET_CLI_CYCLONEDX_CDXGEN_VERSION,
     },
     args,
-    { force: false, silent: true, ...options },
+    { silent: true, ...options },
     spawnExtra,
   )
 }
@@ -344,7 +185,7 @@ export async function spawnSynpDlx(
       version: `${constants.ENV.INLINED_SOCKET_CLI_SYNP_VERSION}`,
     },
     args,
-    { force: false, silent: true, ...options },
+    { silent: true, ...options },
     spawnExtra,
   )
 }

@@ -5,12 +5,16 @@ import { logger } from '@socketsecurity/registry/lib/logger'
 
 import { detectManifestActions } from './detect-manifest-actions.mts'
 import { generateAutoManifest } from './generate_auto_manifest.mts'
+import { excludePathsFlag } from './manifest-flags.mts'
 import constants from '../../constants.mts'
 import { commonFlags } from '../../flags.mts'
+import { cmdFlagValueToArray } from '../../utils/cmd.mts'
+import { withTmpDir } from '../../utils/fs.mts'
 import { getOutputKind } from '../../utils/get-output-kind.mts'
 import { meowOrExit } from '../../utils/meow-with-subcommands.mts'
 import { getFlagListOutput } from '../../utils/output-formatting.mts'
 import { readOrDefaultSocketJson } from '../../utils/socket-json.mts'
+import { assertValidExcludePaths } from '../scan/exclude-paths.mts'
 
 import type {
   CliCommandConfig,
@@ -23,6 +27,7 @@ const config: CliCommandConfig = {
   hidden: false,
   flags: {
     ...commonFlags,
+    ...excludePathsFlag,
     verbose: {
       type: 'boolean',
       default: false,
@@ -117,12 +122,19 @@ async function run(
     return
   }
 
-  await generateAutoManifest({
-    detected,
-    cwd,
-    outputKind,
-    verbose,
-  })
+  const excludePaths = cmdFlagValueToArray(cli.flags['excludePaths'])
+  assertValidExcludePaths(excludePaths)
+
+  await withTmpDir('socket-manifest-auto-', tmpDir =>
+    generateAutoManifest({
+      detected,
+      cwd,
+      excludePaths,
+      outputKind,
+      tmpDir,
+      verbose,
+    }),
+  )
 
   logger.success(
     `Finished. Should have attempted to generate manifest files for ${detected.count} targets.`,

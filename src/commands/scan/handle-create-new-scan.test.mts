@@ -1,11 +1,30 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import {
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs'
+import { tmpdir } from 'node:os'
+import path from 'node:path'
 
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+
+import { logger } from '@socketsecurity/registry/lib/logger'
+
+import { finalizeTier1Scan } from './finalize-tier1-scan.mts'
 import { handleCreateNewScan } from './handle-create-new-scan.mts'
+import { outputCreateNewScan } from './output-create-new-scan.mts'
+import { makeReachabilityOptions } from '../../../test/reachability-options.mts'
+
+import type { HandleCreateNewScanConfig } from './handle-create-new-scan.mts'
 
 const {
   mockFetchCreateOrgFullScan,
   mockFetchSupportedScanFileNames,
   mockFindSocketYmlSync,
+  mockGenerateAutoManifest,
+  mockGenerateRecursiveManifests,
   mockGetPackageFilesForScan,
   mockPerformReachabilityAnalysis,
   mockReadOrDefaultSocketJson,
@@ -13,6 +32,8 @@ const {
   mockFetchCreateOrgFullScan: vi.fn(),
   mockFetchSupportedScanFileNames: vi.fn(),
   mockFindSocketYmlSync: vi.fn(),
+  mockGenerateAutoManifest: vi.fn(),
+  mockGenerateRecursiveManifests: vi.fn(),
   mockGetPackageFilesForScan: vi.fn(),
   mockPerformReachabilityAnalysis: vi.fn(),
   mockReadOrDefaultSocketJson: vi.fn(),
@@ -58,9 +79,44 @@ vi.mock('../manifest/detect-manifest-actions.mts', () => ({
   detectManifestActions: vi.fn(() => Promise.resolve({ count: 0 })),
 }))
 
-vi.mock('../manifest/generate_auto_manifest.mts', () => ({
-  generateAutoManifest: vi.fn(),
+vi.mock('../manifest/generate-recursive-manifests.mts', () => ({
+  generateRecursiveManifests: mockGenerateRecursiveManifests,
 }))
+
+vi.mock('../manifest/generate_auto_manifest.mts', () => ({
+  generateAutoManifest: mockGenerateAutoManifest,
+}))
+
+function createConfig(
+  overrides: Partial<HandleCreateNewScanConfig> = {},
+): HandleCreateNewScanConfig {
+  return {
+    autoManifest: false,
+    branchName: 'main',
+    commitHash: '',
+    commitMessage: '',
+    committers: '',
+    cwd: '/repo',
+    defaultBranch: false,
+    interactive: false,
+    orgSlug: 'fakeOrg',
+    outputKind: 'text',
+    pendingHead: false,
+    pullRequest: 0,
+    reach: {
+      ...makeReachabilityOptions(),
+      reachFallbackToRegularScan: false,
+      runReachabilityAnalysis: false,
+    },
+    readOnly: false,
+    repoName: 'repo',
+    report: false,
+    reportLevel: 'error',
+    targets: ['/repo'],
+    tmp: false,
+    ...overrides,
+  }
+}
 
 describe('handleCreateNewScan excludePaths', () => {
   beforeEach(() => {
@@ -78,6 +134,8 @@ describe('handleCreateNewScan excludePaths', () => {
       data: { parsed: { projectIgnorePaths: ['fixtures/**'] } },
       ok: true,
     })
+    mockGenerateAutoManifest.mockResolvedValue({ generatedFiles: [] })
+    mockGenerateRecursiveManifests.mockResolvedValue([])
     mockGetPackageFilesForScan.mockResolvedValue(['package.json'])
     mockPerformReachabilityAnalysis.mockResolvedValue({
       data: {
@@ -87,6 +145,415 @@ describe('handleCreateNewScan excludePaths', () => {
       ok: true,
     })
     mockReadOrDefaultSocketJson.mockReturnValue({})
+  })
+
+  it('uploads only generated scan files and cleans them up after uploading', async () => {
+    const cleanup = vi.fn()
+    const files = [
+      '/repo/packages/api/socket-uv-cdx.json',
+      '/repo/packages/worker/socket-uv-cdx.json',
+    ]
+    mockFetchCreateOrgFullScan.mockImplementationOnce(async () => {
+      expect(cleanup).not.toHaveBeenCalled()
+      return { ok: true, data: { id: 'scan-id' } }
+    })
+    await handleCreateNewScan(
+      createConfig({
+        generateScanFiles: async () => ({ cleanup, files }),
+        targets: ['packages/api', 'packages/worker'],
+      }),
+    )
+    expect(mockGetPackageFilesForScan).not.toHaveBeenCalled()
+    expect(mockFetchCreateOrgFullScan).toHaveBeenCalledWith(
+      files,
+      'fakeOrg',
+      expect.anything(),
+      expect.objectContaining({ cwd: '/repo' }),
+    )
+    expect(cleanup).toHaveBeenCalledOnce()
+  })
+
+  it('cleans up generated scan files in read-only mode without uploading', async () => {
+    const cleanup = vi.fn()
+    await handleCreateNewScan(
+      createConfig({
+        generateScanFiles: async () => ({ cleanup, files: ['/repo/a.json'] }),
+        readOnly: true,
+      }),
+    )
+    expect(mockFetchCreateOrgFullScan).not.toHaveBeenCalled()
+    expect(cleanup).toHaveBeenCalledOnce()
+  })
+
+  it('cleans up generated scan files when the upload throws', async () => {
+    const cleanup = vi.fn()
+    mockFetchCreateOrgFullScan.mockRejectedValueOnce(new Error('upload failed'))
+    await expect(
+      handleCreateNewScan(
+        createConfig({
+          generateScanFiles: async () => ({ cleanup, files: ['/repo/a.json'] }),
+        }),
+      ),
+    ).rejects.toThrow('upload failed')
+    expect(cleanup).toHaveBeenCalledOnce()
+  })
+
+  it('stops before discovery and upload when generating scan files fails', async () => {
+    await expect(
+      handleCreateNewScan(
+        createConfig({
+          generateScanFiles: async () => {
+            throw new Error('export failed')
+          },
+        }),
+      ),
+    ).rejects.toThrow('export failed')
+    expect(mockFetchSupportedScanFileNames).not.toHaveBeenCalled()
+    expect(mockGetPackageFilesForScan).not.toHaveBeenCalled()
+    expect(mockFetchCreateOrgFullScan).not.toHaveBeenCalled()
+  })
+
+  it('analyzes generated scan files against the target with the default upload roots', async () => {
+    const cleanup = vi.fn()
+    const files = ['/repo/packages/api/socket-uv-cdx.json']
+    const config = createConfig({
+      generateScanFiles: async () => ({ cleanup, files }),
+      targets: ['packages/api'],
+    })
+    config.reach.runReachabilityAnalysis = true
+    mockPerformReachabilityAnalysis.mockResolvedValueOnce({
+      data: {
+        reachabilityReport: 'packages/api/.socket.facts.json',
+        tier1ReachabilityScanId: 'tier1-id',
+      },
+      ok: true,
+    })
+    await handleCreateNewScan(config)
+    expect(mockPerformReachabilityAnalysis).toHaveBeenCalledWith(
+      expect.objectContaining({
+        cwd: '/repo',
+        packagePaths: files,
+        target: 'packages/api',
+      }),
+    )
+    expect(mockFetchCreateOrgFullScan).toHaveBeenCalledWith(
+      [...files, 'packages/api/.socket.facts.json'],
+      'fakeOrg',
+      expect.anything(),
+      expect.objectContaining({ cwd: '/repo' }),
+    )
+    expect(cleanup).toHaveBeenCalledOnce()
+  })
+
+  it('keeps build facts but not earlier reports next to the reachability report', async () => {
+    const cleanup = vi.fn()
+    const files = [
+      '/repo/pom.xml.socket.facts.json',
+      '/repo/gradle.socket.facts.json',
+      '/repo/service/.socket.facts.json',
+      '/repo/package-lock.json',
+    ]
+    const config = createConfig({
+      generateScanFiles: async () => ({ cleanup, files }),
+    })
+    config.reach.runReachabilityAnalysis = true
+    mockPerformReachabilityAnalysis.mockResolvedValueOnce({
+      data: {
+        reachabilityReport: '.socket.facts.json',
+        tier1ReachabilityScanId: 'tier1-id',
+      },
+      ok: true,
+    })
+    await handleCreateNewScan(config)
+    expect(mockFetchCreateOrgFullScan).toHaveBeenCalledWith(
+      [
+        '/repo/pom.xml.socket.facts.json',
+        '/repo/gradle.socket.facts.json',
+        '/repo/package-lock.json',
+        '.socket.facts.json',
+      ],
+      'fakeOrg',
+      expect.anything(),
+      expect.anything(),
+    )
+  })
+
+  it('keeps build facts but not earlier reports when using only pre-generated SBOMs', async () => {
+    const cleanup = vi.fn()
+    const files = [
+      '/repo/pom.xml.socket.facts.json',
+      '/repo/service/.socket.facts.json',
+      '/repo/package-lock.json',
+    ]
+    const config = createConfig({
+      generateScanFiles: async () => ({ cleanup, files }),
+    })
+    config.reach.runReachabilityAnalysis = true
+    config.reach.reachUseOnlyPregeneratedSboms = true
+    mockFetchSupportedScanFileNames.mockResolvedValueOnce({
+      data: { socket: { facts: { pattern: '*.socket.facts.json' } } },
+      ok: true,
+    })
+    mockPerformReachabilityAnalysis.mockResolvedValueOnce({
+      data: {
+        reachabilityReport: '.socket.facts.json',
+        tier1ReachabilityScanId: 'tier1-id',
+      },
+      ok: true,
+    })
+    await handleCreateNewScan(config)
+    expect(mockFetchCreateOrgFullScan).toHaveBeenCalledWith(
+      ['/repo/pom.xml.socket.facts.json', '.socket.facts.json'],
+      'fakeOrg',
+      expect.anything(),
+      expect.anything(),
+    )
+  })
+
+  it('includes generated auto-manifest files in SCA discovery targets', async () => {
+    mockGenerateAutoManifest.mockResolvedValueOnce({
+      generatedFiles: ['/repo/.socket-auto-manifest/maven_install.json'],
+    })
+
+    await handleCreateNewScan(
+      createConfig({
+        autoManifest: true,
+        targets: ['/repo/apps/api'],
+      }),
+    )
+
+    expect(mockGetPackageFilesForScan).toHaveBeenCalledWith(
+      ['/repo/apps/api', '/repo/.socket-auto-manifest/maven_install.json'],
+      { size: 1 },
+      {
+        additionalIgnores: [],
+        config: { projectIgnorePaths: ['fixtures/**'] },
+        cwd: '/repo',
+      },
+    )
+    expect(mockFetchCreateOrgFullScan).toHaveBeenCalled()
+  })
+
+  it('generates nothing beyond Gradle/sbt/Maven when --dynamic-sbom-inference is used without --auto-manifest', async () => {
+    mockGenerateRecursiveManifests.mockResolvedValueOnce([
+      {
+        dir: '/repo/service-a',
+        ecosystem: 'gradle',
+        factsPath: '/repo/service-a/.socket.facts.json',
+        status: 'generated',
+      },
+    ])
+
+    const config = createConfig({ autoManifest: false, targets: ['/repo'] })
+    config.reach.dynamicSbomInference = ['maven', 'nuget']
+
+    await handleCreateNewScan(config)
+
+    expect(mockGenerateRecursiveManifests).toHaveBeenCalledWith(
+      expect.objectContaining({ cwd: '/repo' }),
+    )
+    // generateAutoManifest is what would pull in conda and bazel; the flag on
+    // its own must never reach it.
+    expect(mockGenerateAutoManifest).not.toHaveBeenCalled()
+    expect(mockGetPackageFilesForScan).toHaveBeenCalledWith(
+      ['/repo', '/repo/service-a/.socket.facts.json'],
+      { size: 1 },
+      {
+        additionalIgnores: [],
+        config: { projectIgnorePaths: ['fixtures/**'] },
+        cwd: '/repo',
+      },
+    )
+  })
+
+  it('suppresses auto-manifest JVM branches and merges recursive facts into scan targets when --dynamic-sbom-inference is combined with --auto-manifest', async () => {
+    mockGenerateRecursiveManifests.mockResolvedValueOnce([
+      {
+        dir: '/repo/service-a',
+        ecosystem: 'maven',
+        factsPath: '/repo/service-a/.socket.facts.json',
+        status: 'generated',
+      },
+      {
+        dir: '/repo/service-b',
+        ecosystem: 'gradle',
+        factsPath: '/repo/service-b/.socket.facts.json',
+        status: 'generated',
+      },
+      { dir: '/repo/service-c', ecosystem: 'maven', status: 'empty' },
+    ])
+
+    const config = createConfig({ autoManifest: true, targets: ['/repo'] })
+    config.reach.dynamicSbomInference = ['maven', 'nuget']
+
+    await handleCreateNewScan(config)
+
+    expect(mockGenerateRecursiveManifests).toHaveBeenCalledWith(
+      expect.objectContaining({
+        cwd: '/repo',
+        sbtTmpDir: undefined,
+        withFiles: false,
+      }),
+    )
+    expect(mockGenerateAutoManifest).toHaveBeenCalledWith(
+      expect.objectContaining({
+        detected: expect.objectContaining({
+          gradle: false,
+          maven: false,
+          sbt: false,
+        }),
+      }),
+    )
+    expect(mockGetPackageFilesForScan).toHaveBeenCalledWith(
+      [
+        '/repo',
+        '/repo/service-a/.socket.facts.json',
+        '/repo/service-b/.socket.facts.json',
+      ],
+      { size: 1 },
+      {
+        additionalIgnores: [],
+        config: { projectIgnorePaths: ['fixtures/**'] },
+        cwd: '/repo',
+      },
+    )
+  })
+
+  it('leaves auto-manifest the build tools --dynamic-sbom-inference-ecosystems does not select', async () => {
+    mockGenerateRecursiveManifests.mockResolvedValueOnce([
+      {
+        dir: '/repo/app',
+        ecosystem: 'dotnet',
+        factsPath: '/repo/app/App.csproj.socket.facts.json',
+        status: 'generated',
+      },
+    ])
+
+    const config = createConfig({ autoManifest: true, targets: ['/repo'] })
+    config.reach.dynamicSbomInference = ['nuget']
+
+    await handleCreateNewScan(config)
+
+    expect(mockGenerateRecursiveManifests).toHaveBeenCalledWith(
+      expect.objectContaining({ purlTypes: ['nuget'] }),
+    )
+    expect(mockGenerateAutoManifest).toHaveBeenCalledWith(
+      expect.objectContaining({ detected: { count: 0, dotnet: false } }),
+    )
+  })
+
+  it('aborts instead of silently uploading a partial scan when a recursive build root fails', async () => {
+    mockGenerateRecursiveManifests.mockResolvedValueOnce([
+      {
+        dir: '/repo/service-a',
+        ecosystem: 'maven',
+        factsPath: '/repo/service-a/.socket.facts.json',
+        status: 'generated',
+      },
+      { dir: '/repo/service-b', ecosystem: 'maven', status: 'failed' },
+    ])
+
+    const config = createConfig({ autoManifest: false, targets: ['/repo'] })
+    config.reach.dynamicSbomInference = ['maven', 'nuget']
+
+    await expect(handleCreateNewScan(config)).rejects.toThrow(
+      /one or more independent build roots failed/i,
+    )
+    expect(mockGetPackageFilesForScan).not.toHaveBeenCalled()
+    expect(mockFetchCreateOrgFullScan).not.toHaveBeenCalled()
+  })
+
+  it('aborts when --dynamic-sbom-inference finds no build root', async () => {
+    mockGenerateRecursiveManifests.mockResolvedValueOnce([])
+
+    const config = createConfig({ autoManifest: false, targets: ['/repo'] })
+    config.reach.dynamicSbomInference = ['maven', 'nuget']
+
+    await expect(handleCreateNewScan(config)).rejects.toThrow(
+      /No .NET, Gradle, Maven, or sbt build root was found/,
+    )
+    expect(mockGetPackageFilesForScan).not.toHaveBeenCalled()
+    expect(mockFetchCreateOrgFullScan).not.toHaveBeenCalled()
+  })
+
+  it('does not abort when build roots were found but none generated facts (empty/skippedDisabled), unlike genuinely finding none', async () => {
+    mockGenerateRecursiveManifests.mockResolvedValueOnce([
+      { dir: '/repo/service-a', ecosystem: 'maven', status: 'empty' },
+      { dir: '/repo/service-b', ecosystem: 'maven', status: 'skippedDisabled' },
+    ])
+
+    const config = createConfig({ autoManifest: false, targets: ['/repo'] })
+    config.reach.dynamicSbomInference = ['maven', 'nuget']
+
+    await handleCreateNewScan(config)
+
+    expect(mockGetPackageFilesForScan).toHaveBeenCalled()
+  })
+
+  it('accumulates a sidecar across recursively discovered build roots and forwards it to reachability analysis', async () => {
+    mockGenerateRecursiveManifests.mockImplementationOnce(
+      async ({ sidecarAcc }) => {
+        sidecarAcc?.set('/repo/service-a/.socket.facts.json', {
+          projects: [
+            {
+              type: 'maven',
+              namespace: 'com.example',
+              name: 'app',
+              version: '1.0',
+              subprojectDir: '.',
+              dependencies: [],
+              targets: ['/repo/service-a/build/classes'],
+              sources: ['/repo/service-a/src/main/java'],
+            },
+          ],
+          components: [],
+        })
+        return [
+          {
+            dir: '/repo/service-a',
+            ecosystem: 'maven',
+            factsPath: '/repo/service-a/.socket.facts.json',
+            status: 'generated',
+          },
+        ]
+      },
+    )
+
+    const config = createConfig({ autoManifest: false, targets: ['/repo'] })
+    config.reach.dynamicSbomInference = ['maven', 'nuget']
+    config.reach.runReachabilityAnalysis = true
+
+    await handleCreateNewScan(config)
+
+    expect(mockGenerateRecursiveManifests).toHaveBeenCalledWith(
+      expect.objectContaining({
+        sbtTmpDir: expect.any(String),
+        withFiles: true,
+      }),
+    )
+    expect(mockPerformReachabilityAnalysis).toHaveBeenCalledWith(
+      expect.objectContaining({
+        resolvedPathsSidecar: {
+          '/repo/service-a/.socket.facts.json': {
+            projects: [expect.objectContaining({ name: 'app' })],
+            components: [],
+          },
+        },
+      }),
+    )
+  })
+
+  it('aborts before scan creation when auto-manifest generation fails', async () => {
+    mockGenerateAutoManifest.mockRejectedValueOnce(
+      new Error('Bazel auto-manifest generation failed'),
+    )
+
+    await expect(
+      handleCreateNewScan(createConfig({ autoManifest: true })),
+    ).rejects.toThrow('Bazel auto-manifest generation failed')
+
+    expect(mockFetchSupportedScanFileNames).not.toHaveBeenCalled()
+    expect(mockFetchCreateOrgFullScan).not.toHaveBeenCalled()
   })
 
   it('adds excludePaths to manifest discovery and reachability excludes', async () => {
@@ -104,25 +571,10 @@ describe('handleCreateNewScan excludePaths', () => {
       pendingHead: false,
       pullRequest: 0,
       reach: {
+        ...makeReachabilityOptions(),
         excludePaths: ['tests', 'packages/*'],
-        reachAnalysisMemoryLimit: 8192,
-        reachAnalysisTimeout: 0,
-        reachConcurrency: 1,
-        reachContinueOnAnalysisErrors: false,
-        reachContinueOnInstallErrors: false,
-        reachContinueOnMissingLockFiles: false,
-        reachContinueOnNoSourceFiles: false,
-        reachDebug: false,
-        reachDetailedAnalysisLogFile: false,
-        reachDisableAnalytics: false,
-        reachDisableExternalToolChecks: false,
-        reachEcosystems: [],
-        reachEnableAnalysisSplitting: false,
         reachExcludePaths: ['dist'],
-        reachLazyMode: false,
-        reachSkipCache: false,
-        reachUseOnlyPregeneratedSboms: false,
-        reachVersion: undefined,
+        reachFallbackToRegularScan: false,
         runReachabilityAnalysis: true,
       },
       readOnly: false,
@@ -166,25 +618,10 @@ describe('handleCreateNewScan excludePaths', () => {
       pendingHead: false,
       pullRequest: 0,
       reach: {
+        ...makeReachabilityOptions(),
         excludePaths: ['apps/api/tests', '**/dist'],
-        reachAnalysisMemoryLimit: 8192,
-        reachAnalysisTimeout: 0,
-        reachConcurrency: 1,
-        reachContinueOnAnalysisErrors: false,
-        reachContinueOnInstallErrors: false,
-        reachContinueOnMissingLockFiles: false,
-        reachContinueOnNoSourceFiles: false,
-        reachDebug: false,
-        reachDetailedAnalysisLogFile: false,
-        reachDisableAnalytics: false,
-        reachDisableExternalToolChecks: false,
-        reachEcosystems: [],
-        reachEnableAnalysisSplitting: false,
         reachExcludePaths: ['node_modules'],
-        reachLazyMode: false,
-        reachSkipCache: false,
-        reachUseOnlyPregeneratedSboms: false,
-        reachVersion: undefined,
+        reachFallbackToRegularScan: false,
         runReachabilityAnalysis: true,
       },
       readOnly: false,
@@ -234,25 +671,9 @@ describe('handleCreateNewScan excludePaths', () => {
       pendingHead: false,
       pullRequest: 0,
       reach: {
+        ...makeReachabilityOptions(),
         excludePaths: ['tests'],
-        reachAnalysisMemoryLimit: 8192,
-        reachAnalysisTimeout: 0,
-        reachConcurrency: 1,
-        reachContinueOnAnalysisErrors: false,
-        reachContinueOnInstallErrors: false,
-        reachContinueOnMissingLockFiles: false,
-        reachContinueOnNoSourceFiles: false,
-        reachDebug: false,
-        reachDetailedAnalysisLogFile: false,
-        reachDisableAnalytics: false,
-        reachDisableExternalToolChecks: false,
-        reachEcosystems: [],
-        reachEnableAnalysisSplitting: false,
-        reachExcludePaths: [],
-        reachLazyMode: false,
-        reachSkipCache: false,
-        reachUseOnlyPregeneratedSboms: false,
-        reachVersion: undefined,
+        reachFallbackToRegularScan: false,
         runReachabilityAnalysis: false,
       },
       readOnly: false,
@@ -292,25 +713,10 @@ describe('handleCreateNewScan excludePaths', () => {
       pendingHead: false,
       pullRequest: 0,
       reach: {
+        ...makeReachabilityOptions(),
         excludePaths: ['apps/api'],
-        reachAnalysisMemoryLimit: 8192,
-        reachAnalysisTimeout: 0,
-        reachConcurrency: 1,
-        reachContinueOnAnalysisErrors: false,
-        reachContinueOnInstallErrors: false,
-        reachContinueOnMissingLockFiles: false,
-        reachContinueOnNoSourceFiles: false,
-        reachDebug: false,
-        reachDetailedAnalysisLogFile: false,
-        reachDisableAnalytics: false,
-        reachDisableExternalToolChecks: false,
-        reachEcosystems: [],
-        reachEnableAnalysisSplitting: false,
         reachExcludePaths: ['node_modules'],
-        reachLazyMode: false,
-        reachSkipCache: false,
-        reachUseOnlyPregeneratedSboms: false,
-        reachVersion: undefined,
+        reachFallbackToRegularScan: false,
         runReachabilityAnalysis: true,
       },
       readOnly: false,
@@ -350,25 +756,9 @@ describe('handleCreateNewScan excludePaths', () => {
       pendingHead: false,
       pullRequest: 0,
       reach: {
+        ...makeReachabilityOptions(),
         excludePaths: ['tests'],
-        reachAnalysisMemoryLimit: 8192,
-        reachAnalysisTimeout: 0,
-        reachConcurrency: 1,
-        reachContinueOnAnalysisErrors: false,
-        reachContinueOnInstallErrors: false,
-        reachContinueOnMissingLockFiles: false,
-        reachContinueOnNoSourceFiles: false,
-        reachDebug: false,
-        reachDetailedAnalysisLogFile: false,
-        reachDisableAnalytics: false,
-        reachDisableExternalToolChecks: false,
-        reachEcosystems: [],
-        reachEnableAnalysisSplitting: false,
-        reachExcludePaths: [],
-        reachLazyMode: false,
-        reachSkipCache: false,
-        reachUseOnlyPregeneratedSboms: false,
-        reachVersion: undefined,
+        reachFallbackToRegularScan: false,
         runReachabilityAnalysis: false,
       },
       readOnly: false,
@@ -388,5 +778,264 @@ describe('handleCreateNewScan excludePaths', () => {
         cwd: '/repo',
       },
     )
+  })
+})
+
+describe('handleCreateNewScan full application reachability finalize', () => {
+  let warnSpy: ReturnType<typeof vi.spyOn>
+
+  beforeEach(() => {
+    vi.clearAllMocks()
+    warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => logger)
+    mockFetchSupportedScanFileNames.mockResolvedValue({
+      data: { size: 1 },
+      ok: true,
+    })
+    mockFindSocketYmlSync.mockReturnValue({ ok: false })
+    mockGetPackageFilesForScan.mockResolvedValue(['package.json'])
+    mockFetchCreateOrgFullScan.mockResolvedValue({
+      data: { id: 'scan-id' },
+      ok: true,
+    })
+  })
+
+  afterEach(() => {
+    warnSpy.mockRestore()
+  })
+
+  it('finalizes the full application reachability scan when a scan id and reachability scan id are present', async () => {
+    mockPerformReachabilityAnalysis.mockResolvedValue({
+      data: {
+        reachabilityReport: '.socket.facts.json',
+        tier1ReachabilityScanId: 'tier1-id',
+      },
+      ok: true,
+    })
+
+    const config = createConfig()
+    config.reach.runReachabilityAnalysis = true
+
+    await handleCreateNewScan(config)
+
+    expect(finalizeTier1Scan).toHaveBeenCalledWith('tier1-id', 'scan-id')
+    expect(warnSpy).not.toHaveBeenCalled()
+  })
+
+  it('warns instead of silently skipping finalize when no full application reachability scan id was extracted', async () => {
+    mockPerformReachabilityAnalysis.mockResolvedValue({
+      data: {
+        reachabilityReport: '.socket.facts.json',
+        tier1ReachabilityScanId: undefined,
+      },
+      ok: true,
+    })
+
+    const config = createConfig()
+    config.reach.runReachabilityAnalysis = true
+
+    await handleCreateNewScan(config)
+
+    expect(finalizeTier1Scan).not.toHaveBeenCalled()
+    expect(warnSpy).toHaveBeenCalledTimes(1)
+    expect(String(warnSpy.mock.calls[0]![0])).toMatch(
+      /reachability finalize|reachability report was not linked/i,
+    )
+  })
+})
+
+describe('handleCreateNewScan reachability fallback', () => {
+  let warnSpy: ReturnType<typeof vi.spyOn>
+
+  beforeEach(() => {
+    vi.clearAllMocks()
+    warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => logger)
+    mockFetchSupportedScanFileNames.mockResolvedValue({
+      data: { size: 1 },
+      ok: true,
+    })
+    mockFindSocketYmlSync.mockReturnValue({ ok: false })
+    mockGetPackageFilesForScan.mockResolvedValue(['package.json'])
+    mockFetchCreateOrgFullScan.mockResolvedValue({
+      data: { id: 'scan-id' },
+      ok: true,
+    })
+  })
+
+  afterEach(() => {
+    warnSpy.mockRestore()
+  })
+
+  it('creates a regular scan when reachability fails and the fallback flag is set', async () => {
+    mockPerformReachabilityAnalysis.mockResolvedValue({
+      cause:
+        'Socket compute-artifacts failed: upstream gateway disconnected (code=gateway_disconnect)',
+      message: 'Failed to fetch artifacts from Socket API',
+      ok: false,
+    })
+
+    const config = createConfig()
+    config.reach.runReachabilityAnalysis = true
+    config.reach.reachFallbackToRegularScan = true
+
+    await handleCreateNewScan(config)
+
+    expect(mockFetchCreateOrgFullScan).toHaveBeenCalledWith(
+      ['package.json'],
+      'fakeOrg',
+      expect.objectContaining({ scanType: 'socket' }),
+      expect.anything(),
+    )
+    expect(finalizeTier1Scan).not.toHaveBeenCalled()
+    expect(outputCreateNewScan).not.toHaveBeenCalledWith(
+      expect.objectContaining({ ok: false }),
+      expect.anything(),
+    )
+    expect(warnSpy).toHaveBeenCalledTimes(1)
+    expect(String(warnSpy.mock.calls[0]![0])).toMatch(
+      /Reachability analysis failed: Failed to fetch artifacts from Socket API — Socket compute-artifacts failed.*Falling back to a regular SCA scan without reachability results\./,
+    )
+    expect(outputCreateNewScan).toHaveBeenCalledWith(
+      expect.objectContaining({ ok: true }),
+      expect.objectContaining({
+        reachabilityFallback: {
+          cause:
+            'Socket compute-artifacts failed: upstream gateway disconnected (code=gateway_disconnect)',
+          message: 'Failed to fetch artifacts from Socket API',
+        },
+      }),
+    )
+  })
+
+  it('leaves the fallback marker unset when reachability succeeds', async () => {
+    mockPerformReachabilityAnalysis.mockResolvedValue({
+      data: {
+        reachabilityReport: '.socket.facts.json',
+        tier1ReachabilityScanId: 'tier1-id',
+      },
+      ok: true,
+    })
+
+    const config = createConfig()
+    config.reach.runReachabilityAnalysis = true
+    config.reach.reachFallbackToRegularScan = true
+
+    await handleCreateNewScan(config)
+
+    expect(mockFetchCreateOrgFullScan).toHaveBeenCalledWith(
+      expect.anything(),
+      'fakeOrg',
+      expect.objectContaining({ scanType: 'socket_tier1' }),
+      expect.anything(),
+    )
+    expect(finalizeTier1Scan).toHaveBeenCalledWith('tier1-id', 'scan-id')
+    expect(outputCreateNewScan).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ reachabilityFallback: undefined }),
+    )
+    expect(warnSpy).not.toHaveBeenCalled()
+  })
+
+  it('still halts when reachability fails without the fallback flag', async () => {
+    mockPerformReachabilityAnalysis.mockResolvedValue({
+      cause:
+        'Socket compute-artifacts failed: upstream gateway disconnected (code=gateway_disconnect)',
+      message: 'Failed to fetch artifacts from Socket API',
+      ok: false,
+    })
+
+    const config = createConfig()
+    config.reach.runReachabilityAnalysis = true
+
+    await handleCreateNewScan(config)
+
+    expect(mockFetchCreateOrgFullScan).not.toHaveBeenCalled()
+    expect(outputCreateNewScan).toHaveBeenCalledTimes(1)
+    expect(outputCreateNewScan).toHaveBeenCalledWith(
+      expect.objectContaining({ ok: false }),
+      expect.anything(),
+    )
+    expect(warnSpy).not.toHaveBeenCalled()
+  })
+})
+
+describe('handleCreateNewScan reachability fallback facts files', () => {
+  let cwd: string
+  let warnSpy: ReturnType<typeof vi.spyOn>
+
+  beforeEach(() => {
+    vi.clearAllMocks()
+    warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => logger)
+    cwd = mkdtempSync(path.join(tmpdir(), 'socket-fallback-facts-'))
+    writeFileSync(path.join(cwd, 'package.json'), '{}')
+    mockFetchSupportedScanFileNames.mockResolvedValue({
+      data: { size: 1 },
+      ok: true,
+    })
+    mockFindSocketYmlSync.mockReturnValue({ ok: false })
+  })
+
+  afterEach(() => {
+    warnSpy.mockRestore()
+    rmSync(cwd, { recursive: true, force: true })
+  })
+
+  it('uploads the pre-analysis facts file the analysis overwrote', async () => {
+    const factsPath = path.join(cwd, '.socket.facts.json')
+    writeFileSync(factsPath, JSON.stringify({ producer: 'gradle' }))
+
+    mockGetPackageFilesForScan.mockResolvedValue([
+      'package.json',
+      '.socket.facts.json',
+    ])
+    mockPerformReachabilityAnalysis.mockImplementation(async () => {
+      writeFileSync(factsPath, '{"partial": true')
+      return {
+        cause: 'upstream gateway disconnected',
+        message: 'Failed to fetch artifacts from Socket API',
+        ok: false,
+      }
+    })
+
+    let uploadedFacts: string | undefined
+    mockFetchCreateOrgFullScan.mockImplementation(async () => {
+      uploadedFacts = readFileSync(factsPath, 'utf8')
+      return { data: { id: 'scan-id' }, ok: true }
+    })
+
+    const config = createConfig({ cwd, targets: [cwd] })
+    config.reach.runReachabilityAnalysis = true
+    config.reach.reachFallbackToRegularScan = true
+
+    await handleCreateNewScan(config)
+
+    expect(JSON.parse(uploadedFacts!)).toEqual({ producer: 'gradle' })
+    expect(JSON.parse(readFileSync(factsPath, 'utf8'))).toEqual({
+      producer: 'gradle',
+    })
+  })
+
+  it('removes the report a failed analysis left behind', async () => {
+    const factsPath = path.join(cwd, '.socket.facts.json')
+
+    mockGetPackageFilesForScan.mockResolvedValue(['package.json'])
+    mockPerformReachabilityAnalysis.mockImplementation(async () => {
+      writeFileSync(factsPath, '{"partial": true')
+      return {
+        message: 'Failed to fetch artifacts from Socket API',
+        ok: false,
+      }
+    })
+    mockFetchCreateOrgFullScan.mockResolvedValue({
+      data: { id: 'scan-id' },
+      ok: true,
+    })
+
+    const config = createConfig({ cwd, targets: [cwd] })
+    config.reach.runReachabilityAnalysis = true
+    config.reach.reachFallbackToRegularScan = true
+
+    await handleCreateNewScan(config)
+
+    expect(existsSync(factsPath)).toBe(false)
   })
 })

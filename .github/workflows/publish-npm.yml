@@ -1,0 +1,795 @@
+name: Publish to npm registry
+
+# Release process for the v1.x line — three packages from one source
+# (socket, @socketsecurity/cli, @socketsecurity/cli-with-sentry):
+#
+#   1. Between releases nobody touches the version. package.json keeps the
+#      last released number and user-facing notes accrue under the
+#      CHANGELOG's `## [Unreleased]` section as they land.
+#   2. Dispatch with mode=release-pr. The `derive` job runs
+#      scripts/release/bump.mts to pick the next version and rewrite
+#      package.json + CHANGELOG.md. With dry-run=true (the default) it only
+#      prints the version. With dry-run=false the `release-pr` job commits the
+#      pair via the release App onto `npm-publish-v<X.Y.Z>` and opens a
+#      `chore(release): X.Y.Z` PR into this branch.
+#   3. A human reviews and squash-merges the release PR. v1.x is protected, so
+#      that PR is the only way a version bump reaches it.
+#   4. Dispatch with mode=publish. A dry run builds, packs, and smoke-tests
+#      HEAD and creates nothing. With dry-run=false the `verify` job checks out
+#      the newest commit that changed package.json's version (the merged
+#      release PR) and builds that. This branch is the line customers consume,
+#      so it owns `latest`. The guard below refuses that tag from anywhere else.
+#   5. `publish` cuts the v<X.Y.Z> tag + the immutable GitHub release at that
+#      commit, then STAGES the exact tarballs `verify` packed.
+#   6. A human promotes each staged upload (`pnpm stage approve` with web
+#      2FA, or the npm web UI). Nothing is public until then.
+#
+# Stable tags from this major version reserve their versions, including tags
+# on unlanded bump commits. Reachable tags anchor the changelog history.
+# The next release must exceed every reserved version on this major line.
+#
+# THE VERSION DECISION IS THE COMMITS'. Patch by default; a `feat:` in range
+# makes it minor. A MAJOR is never derived — a breaking commit stops the bump
+# and asks a human to pass release-as.
+#
+# CREDENTIAL BOUNDARIES. `derive` and `verify` install and build, and hold no
+# write credential of any kind. `release-pr` holds the release App token and
+# runs no installed code. `publish` holds the registry credential and does
+# almost nothing: no checkout, no install, no build. It publishes the exact
+# bytes `verify` packed and proved, so what shipped is what was tested.
+
+on:
+  workflow_dispatch:
+    inputs:
+      dist-tag:
+        description: 'npm dist-tag (latest, next, beta, canary, backport, etc.)'
+        required: false
+        default: 'latest'
+        type: string
+      mode:
+        description: 'release-pr opens the version bump PR. publish releases the newest merged release PR.'
+        required: false
+        default: 'publish'
+        type: choice
+        options:
+          - publish
+          - release-pr
+      dry-run:
+        description: 'Defaults to true so an accidental dispatch writes nothing. release-pr: print the next version without opening a PR. publish: build everything but do NOT publish, tag, or cut a release.'
+        required: false
+        default: true
+        type: boolean
+      release-as:
+        description: 'release-pr only. Force the bump level instead of deriving it from the commits. MAJOR is never derived — a breaking change stops the bump until a human picks major here.'
+        required: false
+        default: ''
+        type: choice
+        options:
+          - ''
+          - major
+          - minor
+          - patch
+      debug:
+        description: 'Enable debug output'
+        required: false
+        default: '0'
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: npm-publish-${{ github.repository }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # Build, pack, and prove every variant WITHOUT any publish credential: this
+  # job binds no environment and mints no OIDC token, so nothing it runs —
+  # install scripts and build tooling — can reach a token.
+  # It hands the publish job three verified tarballs; those exact bytes are
+  # what ship, so what was tested is what publishes.
+  verify:
+    name: Verify and pack
+    if: ${{ inputs.mode == 'publish' }}
+    runs-on: ubuntu-latest
+
+    permissions:
+      actions: read
+      contents: read
+
+    outputs:
+      artifact-id: ${{ steps.upload.outputs.artifact-id }}
+      artifact-digest: ${{ steps.upload.outputs.artifact-digest }}
+      sha: ${{ steps.release-meta.outputs.sha }}
+      version: ${{ steps.release-meta.outputs.version }}
+
+    steps:
+      # npm trusted publishing authorizes on repository + workflow filename +
+      # GitHub environment. It does NOT pin a branch. The `publish-npm`
+      # environment's deployment-branch policy (main + v1.x) is the outer
+      # gate; this guard is the in-repo half.
+      #
+      # `latest` is what an untagged install of the package resolves to, so it
+      # belongs to the line customers consume — and that is THIS branch. The
+      # default branch carries the 2.x PRERELEASE line and is refused `latest`
+      # by its own copy of this workflow, which reads the owning branch from
+      # `release.latestDistTagBranch` in .config/repo/socket-wheelhouse.json.
+      #
+      # Dry runs pass regardless of dist-tag: they upload nothing.
+      - name: Guard the latest dist-tag to the consumable release line
+        if: ${{ inputs.dry-run == false && inputs.dist-tag == 'latest' }}
+        env:
+          LATEST_BRANCH: v1.x
+          REF: ${{ github.ref }}
+        run: |
+          if [ "$REF" != "refs/heads/$LATEST_BRANCH" ]; then
+            echo "Refusing to publish dist-tag 'latest' from $REF." >&2
+            echo "Only refs/heads/$LATEST_BRANCH may publish 'latest' — it is the line customers consume." >&2
+            echo "Re-dispatch from $LATEST_BRANCH, or pick a prerelease dist-tag (next, beta, canary, rc)." >&2
+            exit 1
+          fi
+          echo "dist-tag 'latest' is allowed from $REF (consumable line: $LATEST_BRANCH)."
+
+      # Full history locates the release commit here and anchors the changelog
+      # in `derive`. All tags expose reserved versions, including release tags
+      # on bump commits that did not land.
+      - &checkout-full-history
+        name: Checkout source
+        shell: bash
+        env:
+          CHECKOUT_REF: ${{ github.sha }}
+          GITHUB_TOKEN: ${{ github.token }}
+          SERVER_URL: ${{ github.server_url }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          git init -q
+          git config --local advice.detachedHead false
+          git remote add origin "${SERVER_URL}/${REPOSITORY}"
+          AUTH_B64="$(printf 'x-access-token:%s' "$GITHUB_TOKEN" | base64 | tr -d '\n')"
+          export GIT_CONFIG_COUNT=1
+          export GIT_CONFIG_KEY_0="http.${SERVER_URL}/.extraheader"
+          export GIT_CONFIG_VALUE_0="AUTHORIZATION: basic ${AUTH_B64}"
+          git fetch --tags origin "$CHECKOUT_REF" '+refs/heads/*:refs/remotes/origin/*'
+          git checkout -q --detach FETCH_HEAD
+
+      # A real publish ships the newest first-parent commit that changed
+      # package.json's version, i.e. the merged release PR. Commits merged after
+      # it wait for the next release, and a version nobody reviewed in a release
+      # PR never ships. A dry run packs HEAD as it is.
+      - name: Check out the release commit
+        if: ${{ inputs.dry-run == false }}
+        run: |
+          set -euo pipefail
+          for COMMIT in $(git rev-list --first-parent --max-count=500 HEAD -- package.json); do
+            VERSION=$(git show "$COMMIT:package.json" | jq -r .version)
+            PREVIOUS=$(git show "$COMMIT^:package.json" 2>/dev/null | jq -r .version || true)
+            if [ "$VERSION" != "$PREVIOUS" ]; then
+              git checkout -q --detach "$COMMIT"
+              echo "Releasing $VERSION from $(git log -1 --format='%h %s')."
+              exit 0
+            fi
+          done
+          echo "::error::No commit on this branch changed the package.json version." >&2
+          echo "::error::Fix: dispatch with mode=release-pr, merge that PR, then dispatch mode=publish." >&2
+          exit 1
+
+      - &install-pnpm
+        name: Install pnpm
+        shell: bash
+        run: | # zizmor: ignore[github-env]
+          # pnpm 11 is required for `pnpm stage publish` (the staged upload
+          # the per-package trusted-publisher grants allow) and ships tar.gz
+          # release assets (a `pnpm` binary + its dist/ tree). The job only
+          # runs ubuntu-latest, so only the Linux assets are pinned.
+          PNPM_VERSION="11.17.0"
+          PNPM_DIR="${RUNNER_TEMP:-/tmp}/pnpm-bin"
+          KERNEL="$(uname -s | cut -d- -f1)"
+          ARCH="$(uname -m)"
+          case "${KERNEL}-${ARCH}" in
+            Linux-x86_64)  ASSET="pnpm-linux-x64.tar.gz"   ; EXPECTED_SHA256="bdb1db01bf0f757495405a59a09c5c287f315889dc98d3b14bc374b9fe43a0bf" ;;
+            Linux-aarch64) ASSET="pnpm-linux-arm64.tar.gz" ; EXPECTED_SHA256="730d17de742a3efbb020ba91d7acfc0456c6ba6ad1cd8eb49f4c229fe9f504d3" ;;
+            *) echo "Unsupported platform: ${KERNEL}-${ARCH}" >&2; exit 1 ;;
+          esac
+          PNPM_BIN="$PNPM_DIR/pnpm"
+          if [ ! -x "$PNPM_BIN" ]; then
+            mkdir -p "$PNPM_DIR"
+            curl -fsSL -o "$PNPM_DIR/$ASSET" "https://github.com/pnpm/pnpm/releases/download/v${PNPM_VERSION}/${ASSET}"
+            ACTUAL_SHA256="$( (sha256sum "$PNPM_DIR/$ASSET" 2>/dev/null || shasum -a 256 "$PNPM_DIR/$ASSET") | cut -d' ' -f1)"
+            if [ "$ACTUAL_SHA256" != "$EXPECTED_SHA256" ]; then
+              echo "Checksum mismatch for ${ASSET}!" >&2
+              echo "  Expected: ${EXPECTED_SHA256}" >&2
+              echo "  Actual:   ${ACTUAL_SHA256}" >&2
+              rm -f "$PNPM_DIR/$ASSET"
+              exit 1
+            fi
+            tar -xzf "$PNPM_DIR/$ASSET" -C "$PNPM_DIR"
+            chmod +x "$PNPM_BIN"
+          fi
+          echo "$PNPM_DIR" >> "${GITHUB_PATH:-/dev/null}"
+
+      # Prove the pinned pnpm owns `stage` BEFORE anything else runs — from a
+      # neutral cwd so the packageManager delegation cannot swap it out. Runs
+      # on dry runs too, so the weekly validation catches a broken stage
+      # toolchain without burning a version.
+      - name: Verify the stage command resolves
+        working-directory: ${{ runner.temp }}
+        run: |
+          "${RUNNER_TEMP}/pnpm-bin/pnpm" --version
+          "${RUNNER_TEMP}/pnpm-bin/pnpm" stage --help > /dev/null
+          echo "pnpm stage resolves via the pinned binary."
+
+      - &install-node
+        name: Install Node.js
+        shell: bash
+        env:
+          NODE_VERSION: 25.9.0
+        run: node scripts/ci/setup-node.mjs --version "$NODE_VERSION"
+
+      - &download-sfw
+        name: Download sfw
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOCKET_API_KEY: ${{ secrets.SOCKET_API_TOKEN_FOR_CLI_AND_SFW }} # zizmor: ignore[secrets-outside-env]
+        run: | # zizmor: ignore[github-env]
+          # Pinned version + per-platform checksum pairs. Bumping a tool
+          # requires updating the matching version AND every platform's
+          # SHA256 in the same commit, otherwise the download / verify
+          # steps will diverge.
+          SFW_FREE_VERSION="1.15.0"
+          SFW_ENTERPRISE_VERSION="1.15.0"
+          SFW_DIR="${RUNNER_TEMP:-/tmp}/sfw-bin"
+          KERNEL="$(uname -s | cut -d- -f1)"
+          ARCH="$(uname -m)"
+          USE_ENTERPRISE=false
+          [ -n "$SOCKET_API_KEY" ] && USE_ENTERPRISE=true
+          if [ "$USE_ENTERPRISE" = "true" ]; then
+            REPO="SocketDev/firewall-release"
+            SFW_VERSION="$SFW_ENTERPRISE_VERSION"
+            case "${KERNEL}-${ARCH}" in
+              Linux-x86_64)                      ASSET="sfw-linux-x86_64"       ; SFW_BIN="$SFW_DIR/sfw"     ; EXPECTED_SHA256="5d33de4859e5138633592fb49a62fb9ac520a6a16211100d21bcb871a9b2d77f" ;;
+              Linux-aarch64)                     ASSET="sfw-linux-arm64"         ; SFW_BIN="$SFW_DIR/sfw"     ; EXPECTED_SHA256="4cc5c51eb224cfa1c9819c218cc39753bce5273e89a50dfd226d8d71449bfd95" ;;
+              Darwin-x86_64)                     ASSET="sfw-macos-x86_64"       ; SFW_BIN="$SFW_DIR/sfw"     ; EXPECTED_SHA256="fc39d500171dfa53eba26e4f59dfd187f3ae47094b8d3a54b7ac53df1c770245" ;;
+              Darwin-arm64)                      ASSET="sfw-macos-arm64"        ; SFW_BIN="$SFW_DIR/sfw"     ; EXPECTED_SHA256="98c87f9316a3caf67f33bb065f6b08123ae90325164535cf5b692cb1024cb64e" ;;
+              MINGW64_NT-x86_64|MSYS_NT-x86_64) ASSET="sfw-windows-x86_64.exe" ; SFW_BIN="$SFW_DIR/sfw.exe" ; EXPECTED_SHA256="7869366709d7ca25c096ec0bcd98f5b69d9f2f13c4c0964dd5b8f656d0fb4359" ;;
+              *) echo "Unsupported platform: ${KERNEL}-${ARCH}" >&2; exit 1 ;;
+            esac
+          else
+            REPO="SocketDev/sfw-free"
+            SFW_VERSION="$SFW_FREE_VERSION"
+            case "${KERNEL}-${ARCH}" in
+              Linux-x86_64)                      ASSET="sfw-free-linux-x86_64"       ; SFW_BIN="$SFW_DIR/sfw"     ; EXPECTED_SHA256="c80371910a808ea5c68916c48e5451716a91ca411cf5e422fdbd8119729b742c" ;;
+              Linux-aarch64)                     ASSET="sfw-free-linux-arm64"         ; SFW_BIN="$SFW_DIR/sfw"     ; EXPECTED_SHA256="55671fa409ef3d40fcee66acbba4d7acfff8a5332d349ad47cca809ebf473cd0" ;;
+              Darwin-x86_64)                     ASSET="sfw-free-macos-x86_64"       ; SFW_BIN="$SFW_DIR/sfw"     ; EXPECTED_SHA256="07cfcc9805812130ebca07f73c51c2cd9c0181b394f25be4c969c0d31c9dc26f" ;;
+              Darwin-arm64)                      ASSET="sfw-free-macos-arm64"        ; SFW_BIN="$SFW_DIR/sfw"     ; EXPECTED_SHA256="fa473291b8b76220f4b636cf655e8a4dc03332145bdea3acfd9bc96887b2da20" ;;
+              MINGW64_NT-x86_64|MSYS_NT-x86_64) ASSET="sfw-free-windows-x86_64.exe" ; SFW_BIN="$SFW_DIR/sfw.exe" ; EXPECTED_SHA256="029882f10e1020c96353b184ec0dba7da853e0f6d35131ca930515a7e61e89e6" ;;
+              *) echo "Unsupported platform: ${KERNEL}-${ARCH}" >&2; exit 1 ;;
+            esac
+          fi
+          if [ ! -x "$SFW_BIN" ]; then
+            mkdir -p "$SFW_DIR"
+            DOWNLOAD_URL="$(gh api "repos/${REPO}/releases/tags/v${SFW_VERSION}" \
+              --jq ".assets[] | select(.name == \"$ASSET\") | .browser_download_url")"
+            if [ -z "$DOWNLOAD_URL" ]; then
+              echo "Asset ${ASSET} not found in ${REPO}@v${SFW_VERSION}" >&2
+              exit 1
+            fi
+            curl -fsSL -o "$SFW_BIN" "$DOWNLOAD_URL"
+            # shellcheck disable=SC1003 # `tr -d '\\'` strips the leading backslash GNU coreutils prepends to a checksum line when the path has a backslash (Windows RUNNER_TEMP).
+            ACTUAL_SHA256="$( (sha256sum "$SFW_BIN" 2>/dev/null || shasum -a 256 "$SFW_BIN") | cut -d' ' -f1 | tr -d '\\')"
+            if [ "$ACTUAL_SHA256" != "$EXPECTED_SHA256" ]; then
+              echo "Checksum mismatch for ${ASSET} (${REPO}@v${SFW_VERSION})!" >&2
+              echo "  Expected: ${EXPECTED_SHA256}" >&2
+              echo "  Actual:   ${ACTUAL_SHA256}" >&2
+              rm -f "$SFW_BIN"
+              exit 1
+            fi
+            chmod +x "$SFW_BIN"
+          fi
+          echo "SFW_BIN=$SFW_BIN" >> "${GITHUB_ENV:-/dev/null}"
+          echo "SFW_IS_ENTERPRISE=$USE_ENTERPRISE" >> "${GITHUB_ENV:-/dev/null}"
+          if [ "$USE_ENTERPRISE" = "true" ]; then
+            echo "SOCKET_API_KEY=$SOCKET_API_KEY" >> "${GITHUB_ENV:-/dev/null}"
+          fi
+
+      - &create-sfw-shims
+        name: Create sfw shims
+        shell: bash
+        run: | # zizmor: ignore[github-env]
+          SHIM_DIR="${RUNNER_TEMP:-/tmp}/sfw-shim"
+          rm -rf "$SHIM_DIR"
+          mkdir -p "$SHIM_DIR"
+          IS_WINDOWS=false
+          [[ "$OSTYPE" == msys* || "$OSTYPE" == cygwin* ]] && IS_WINDOWS=true
+          msys_to_win_path() {
+            if $IS_WINDOWS && [[ "$1" =~ ^/([a-zA-Z])/(.*) ]]; then
+              echo "${BASH_REMATCH[1]^^}:\\${BASH_REMATCH[2]//\//\\}"
+            else
+              echo "$1"
+            fi
+          }
+          strip_shim_dir() { echo "$PATH" | tr ':' '\n' | grep -vxF "$SHIM_DIR" | paste -sd: -; }
+          CLEAN_PATH="$(strip_shim_dir)"
+          # Wrapper mode ecosystems (sfw-free):
+          #   JavaScript/TypeScript: npm, yarn, pnpm
+          #   Python: pip, uv
+          #   Rust: cargo
+          # https://github.com/SocketDev/sfw-free?tab=readme-ov-file#supported-package-managers
+          #
+          # Additional wrapper mode ecosystems (sfw-enterprise):
+          #   Ruby: gem, bundler
+          #   .NET: nuget
+          #   Go: go (Linux only)
+          # https://github.com/SocketDev/firewall-release/wiki#support-matrix
+          SSL_WORKAROUND=""
+          SHIM_CMDS="npm yarn pnpm pip uv cargo"
+          if [ "$SFW_IS_ENTERPRISE" = "true" ]; then
+            SHIM_CMDS="npm yarn pnpm pip uv cargo gem bundler nuget"
+            # Go wrapper mode is only supported on Linux.
+            [[ "$OSTYPE" == linux* ]] && SHIM_CMDS="$SHIM_CMDS go"
+          else
+            SSL_WORKAROUND='export GIT_SSL_NO_VERIFY=true # Workaround: sfw-free does not yet set GIT_SSL_CAINFO.'
+          fi
+          for CMD in $SHIM_CMDS; do
+            REAL="$(PATH="$CLEAN_PATH" command -v "$CMD" 2>/dev/null || true)"
+            [ -z "$REAL" ] && continue
+            REAL="$(msys_to_win_path "$REAL")"
+            SHIM_LINES=('#!/bin/bash' "export PATH=\"\$(echo \"\$PATH\" | tr ':' '\n' | grep -vxF '${SHIM_DIR}' | paste -sd: -)\"")
+            [ -n "$SSL_WORKAROUND" ] && SHIM_LINES+=("$SSL_WORKAROUND")
+            SHIM_LINES+=("exec \"${SFW_BIN}\" \"${REAL}\" \"\$@\"")
+            printf '%s\n' "${SHIM_LINES[@]}" > "$SHIM_DIR/$CMD"
+            chmod +x "$SHIM_DIR/$CMD"
+            if $IS_WINDOWS; then
+              printf '@echo off\r\nset "PATH=;%%PATH%%;"\r\nset "PATH=%%PATH:;%s;=;%%"\r\nset "PATH=%%PATH:~1,-1%%"\r\n"%s" "%s" %%*\r\n' \
+                "$SHIM_DIR" "$SFW_BIN" "$REAL" > "$SHIM_DIR/$CMD.cmd"
+            fi
+          done
+          echo "$SHIM_DIR" >> "${GITHUB_PATH:-/dev/null}"
+          echo "SFW_SHIM_DIR=$SHIM_DIR" >> "${GITHUB_ENV:-/dev/null}"
+
+      - &install-dependencies
+        name: Install dependencies
+        run: pnpm install --loglevel error
+
+      # The version must be a bare X.Y.Z before anything reaches the registry. A
+      # prerelease-suffixed version is a work-in-progress marker, not a
+      # releasable one, so fail closed rather than publish it.
+      - name: Refuse a publish on a non-release version
+        if: ${{ inputs.dry-run == false }}
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          case "$VERSION" in
+            *-*)
+              echo "::error::package.json version is '$VERSION' — a prerelease version, not a releasable one." >&2
+              echo "::error::Where: the tree this run will pack." >&2
+              echo "::error::Saw: a prerelease suffix; wanted a bare X.Y.Z." >&2
+              echo "::error::Fix: land a release-shaped version on v1.x, then re-dispatch." >&2
+              exit 1
+              ;;
+          esac
+          echo "Version $VERSION is release-shaped."
+
+      # Compile the Maven manifest extension jar so the dist build bundles it
+      # into dist/manifest-scripts (the jar is never committed; it ships only in
+      # the published package). Invoke build-jar.sh directly, NOT via `pnpm run`:
+      # Socket Firewall wraps the package managers (npm/pnpm/...) it shims, so a
+      # `pnpm run` would route the Maven wrapper's download through sfw, which
+      # fails on the non-package fetch. Running bash directly keeps the Maven
+      # download outside the shimmed process tree. The org action allowlist forbids
+      # actions/setup-java, so use a JDK pre-installed on the runner image
+      # (JAVA_HOME_17_X64), falling back to the runner's default `java`.
+      - name: Build Maven manifest extension jar
+        run: |
+          if [ -n "${JAVA_HOME_17_X64:-}" ]; then
+            export JAVA_HOME="$JAVA_HOME_17_X64"
+          fi
+          bash src/commands/manifest/scripts/maven-extension/build-jar.sh
+
+      # Same for the dotnet manifest tool: built here, bundled into
+      # dist/manifest-scripts, never committed. The runner image's preinstalled
+      # .NET SDK builds it (actions/setup-dotnet is not on the org allowlist).
+      - name: Build dotnet manifest tool
+        run: bash src/commands/manifest/scripts/dotnet-tool/build-tool.sh
+
+      # PACK ONCE, PUBLISH THOSE BYTES. Each variant is built, packed to a
+      # tarball, and smoke-tested from that tarball; the three tarballs are
+      # uploaded as an artifact and the publish job stages those exact files.
+      # Re-packing at upload time would publish bytes nothing verified.
+      #
+      # The smoke test is the gate that a build being "green" cannot give you:
+      # it installs the packed tarball into a throwaway consumer and runs
+      # every executable the manifest declares. A tarball that installs but
+      # cannot run is caught here, before any release marker exists.
+      # Registry pages render the README from the tarball, where relative
+      # assets/ refs 404. Pin them to the release tag once, before the three
+      # packs, so every variant ships absolute, immutable asset URLs.
+      - name: Pin README assets to the release tag
+        run: node .github/scripts/pin-readme-assets.mjs
+
+      - name: Build and pack socket
+        env:
+          SOCKET_CLI_DEBUG: ${{ inputs.debug }}
+        run: |
+          INLINED_SOCKET_CLI_PUBLISHED_BUILD=1 pnpm run build:dist
+          mkdir -p "$RUNNER_TEMP/dist"
+          pnpm pack --pack-destination "$RUNNER_TEMP/dist"
+
+      - name: Smoke test socket
+        env:
+          PKG: socket
+        run: bash .github/scripts/smoke-test-tarball.sh
+
+      - name: Build and pack @socketsecurity/cli (legacy)
+        env:
+          SOCKET_CLI_DEBUG: ${{ inputs.debug }}
+        run: |
+          INLINED_SOCKET_CLI_PUBLISHED_BUILD=1 INLINED_SOCKET_CLI_LEGACY_BUILD=1 pnpm run build:dist
+          pnpm pack --pack-destination "$RUNNER_TEMP/dist"
+
+      - name: Smoke test @socketsecurity/cli
+        env:
+          PKG: '@socketsecurity/cli'
+        run: bash .github/scripts/smoke-test-tarball.sh
+
+      - name: Build and pack @socketsecurity/cli-with-sentry
+        env:
+          SOCKET_CLI_DEBUG: ${{ inputs.debug }}
+        run: |
+          INLINED_SOCKET_CLI_PUBLISHED_BUILD=1 INLINED_SOCKET_CLI_SENTRY_BUILD=1 pnpm run build:dist
+          pnpm pack --pack-destination "$RUNNER_TEMP/dist"
+
+      - name: Smoke test @socketsecurity/cli-with-sentry
+        env:
+          PKG: '@socketsecurity/cli-with-sentry'
+        run: bash .github/scripts/smoke-test-tarball.sh
+
+      # The release markers belong to the `socket` package, so the version and
+      # the commit are read once here and handed to the publish job. The
+      # publish job never checks the repo out — it only needs these two
+      # strings plus the tarballs.
+      - name: Resolve release metadata
+        id: release-meta
+        run: |
+          git checkout -- package.json
+          VERSION=$(node -p "require('./package.json').version")
+          SHA=$(git rev-parse HEAD)
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "Release subject: socket@$VERSION at $SHA"
+
+      # Refuse a version the registry already carries, BEFORE the markers are
+      # cut. A re-dispatch of an already-shipped or burned number otherwise
+      # gets as far as the tag step, which then hard-fails on the SHA
+      # mismatch — after the release exists.
+      - name: Refuse an already-published version
+        if: ${{ inputs.dry-run == false }}
+        env:
+          VERSION: ${{ steps.release-meta.outputs.version }}
+        run: pnpm run release:preflight --version "$VERSION"
+
+      - name: Upload verified tarballs
+        id: upload
+        uses: ./.github/actions/repo/upload-artifact
+        with:
+          path: ${{ runner.temp }}/dist
+
+      - name: Verify artifact transfer
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARTIFACT_ID: ${{ steps.upload.outputs.artifact-id }}
+          ARTIFACT_DIGEST: ${{ steps.upload.outputs.artifact-digest }}
+          VERSION: ${{ steps.release-meta.outputs.version }}
+          DIST_DIRECTORY: ${{ runner.temp }}/download-check
+        run: &download-verified-tarballs |
+          set -euo pipefail
+          [[ "$ARTIFACT_ID" =~ ^[0-9]+$ ]]
+          [[ "$ARTIFACT_DIGEST" =~ ^[a-f0-9]{64}$ ]]
+          fetch_artifact() {
+            for _ in 1 2 3 4 5 6; do
+              if gh api "$1" > "$2" 2> "$RUNNER_TEMP/gh-api.err"; then
+                return 0
+              fi
+              # The REST API can 404 on an artifact for a few seconds after its upload finalizes.
+              grep -q 'HTTP 404' "$RUNNER_TEMP/gh-api.err" || break
+              sleep 5
+            done
+            cat "$RUNNER_TEMP/gh-api.err" >&2
+            return 1
+          }
+          fetch_artifact "repos/$GITHUB_REPOSITORY/actions/artifacts/$ARTIFACT_ID" "$RUNNER_TEMP/artifact.json"
+          fetch_artifact "repos/$GITHUB_REPOSITORY/actions/artifacts/$ARTIFACT_ID/zip" "$RUNNER_TEMP/artifact.zip"
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, re, shutil, stat, zipfile
+          temporary = pathlib.Path(os.environ["RUNNER_TEMP"])
+          metadata = json.loads((temporary / "artifact.json").read_text())
+          if (str(metadata.get("workflow_run", {}).get("id")) != os.environ["GITHUB_RUN_ID"]
+              or metadata.get("name") != "npm-release-tarballs" or metadata.get("expired")):
+              raise SystemExit("Artifact metadata does not match this release run.")
+          archive = temporary / "artifact.zip"
+          digest = hashlib.sha256()
+          with archive.open("rb") as stream:
+              for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                  digest.update(chunk)
+          if digest.hexdigest() != os.environ["ARTIFACT_DIGEST"]:
+              raise SystemExit("Artifact digest does not match the verified upload.")
+          version = os.environ["VERSION"]
+          if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?", version):
+              raise SystemExit("Invalid release version.")
+          expected = {f"{name}-{version}.tgz" for name in
+                      ("socket", "socketsecurity-cli", "socketsecurity-cli-with-sentry")}
+          with zipfile.ZipFile(archive) as bundle:
+              entries = bundle.infolist()
+              if len(entries) != 3 or {entry.filename for entry in entries} != expected:
+                  raise SystemExit("Artifact must contain exactly the three release tarballs.")
+              if any(entry.file_size > 512 * 1024 * 1024
+                     or stat.S_ISLNK(entry.external_attr >> 16) for entry in entries):
+                  raise SystemExit("Artifact contains an invalid tarball entry.")
+              destination = pathlib.Path(os.environ["DIST_DIRECTORY"])
+              destination.mkdir(parents=True, exist_ok=True)
+              for entry in entries:
+                  with bundle.open(entry) as source, (destination / entry.filename).open("xb") as target:
+                      shutil.copyfileobj(source, target)
+          PY
+
+  # Minimal-surface publish. This job binds the publish-npm environment and
+  # mints the OIDC token, so it runs as little as possible: no repository
+  # checkout, no dependency install, no build. It downloads the verified
+  # tarballs, cuts the release markers, and stages those bytes.
+  publish:
+    name: Mark and stage
+    needs: verify
+    if: ${{ inputs.mode == 'publish' && inputs.dry-run == false }}
+    runs-on: ubuntu-latest
+    # npm's trusted-publisher config pins this GitHub environment name (npm TP
+    # is PER-PACKAGE, not per-branch: the socket / @socketsecurity/cli /
+    # @socketsecurity/cli-with-sentry entries point at publish-npm.yml + the
+    # publish-npm environment). The OIDC token exchange 404s outside it.
+    environment: publish-npm
+
+    permissions:
+      actions: read
+      # `contents: write` creates the v<version> tag via gh api. The token
+      # lives only in the steps that need it, and no checkout ever writes it
+      # into a `.git/config`.
+      contents: write
+      id-token: write # npm trusted publishing via OIDC
+
+    env:
+      TAG: v${{ needs.verify.outputs.version }}
+      VERSION: ${{ needs.verify.outputs.version }}
+
+    steps:
+      # pnpm 11 provides `stage publish`; the pinned tar.gz assets are the
+      # same ones the verify job installs. Checksums must be bumped in
+      # lock-step with the version.
+      - name: Install pnpm
+        shell: bash
+        run: | # zizmor: ignore[github-env]
+          PNPM_VERSION="11.17.0"
+          PNPM_DIR="${RUNNER_TEMP:-/tmp}/pnpm-bin"
+          case "$(uname -m)" in
+            x86_64)  ASSET="pnpm-linux-x64.tar.gz"   ; EXPECTED_SHA256="bdb1db01bf0f757495405a59a09c5c287f315889dc98d3b14bc374b9fe43a0bf" ;;
+            aarch64) ASSET="pnpm-linux-arm64.tar.gz" ; EXPECTED_SHA256="730d17de742a3efbb020ba91d7acfc0456c6ba6ad1cd8eb49f4c229fe9f504d3" ;;
+            *) echo "Unsupported architecture: $(uname -m)" >&2; exit 1 ;;
+          esac
+          mkdir -p "$PNPM_DIR"
+          curl -fsSL -o "$PNPM_DIR/$ASSET" "https://github.com/pnpm/pnpm/releases/download/v${PNPM_VERSION}/${ASSET}"
+          ACTUAL_SHA256="$( (sha256sum "$PNPM_DIR/$ASSET" 2>/dev/null || shasum -a 256 "$PNPM_DIR/$ASSET") | cut -d' ' -f1)"
+          if [ "$ACTUAL_SHA256" != "$EXPECTED_SHA256" ]; then
+            echo "Checksum mismatch for ${ASSET}!" >&2
+            echo "  Expected: ${EXPECTED_SHA256}" >&2
+            echo "  Actual:   ${ACTUAL_SHA256}" >&2
+            exit 1
+          fi
+          tar -xzf "$PNPM_DIR/$ASSET" -C "$PNPM_DIR"
+          chmod +x "$PNPM_DIR/pnpm"
+
+      # digest-mismatch: error — the bytes that arrive must be the bytes the
+      # verify job uploaded, or the run stops.
+      - name: Download verified tarballs
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARTIFACT_ID: ${{ needs.verify.outputs.artifact-id }}
+          ARTIFACT_DIGEST: ${{ needs.verify.outputs.artifact-digest }}
+          DIST_DIRECTORY: ${{ runner.temp }}/dist
+        run: *download-verified-tarballs
+
+      # ORDER RULE (markers first): the v<version> tag and the immutable
+      # GitHub release are cut BEFORE the staged uploads, so the uploads'
+      # provenance binds markers that exist. Exactly ONE tag and ONE release
+      # per run, and they belong to the `socket` package — the two variants
+      # ride the same version without markers of their own.
+      #
+      # The trade is the BURN RULE: a stage rejected after the markers burns
+      # the version. The next release is a patch bump, never a re-publish of
+      # the burned number — the different-SHA hard-fail below enforces it,
+      # while a same-SHA re-run is a no-op tag plus a fresh stage attempt.
+      #
+      # Uses gh api rather than git so the token lives only in this step's
+      # env; the job has no checkout at all.
+      - name: Tag release (idempotent)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PUBLISHED_SHA: ${{ needs.verify.outputs.sha }}
+          REPO: ${{ github.repository }}
+        run: |
+          # gh api exits non-zero on 404 (tag absent) and writes the error
+          # body to stdout, so branch on the exit code — never on whether
+          # stdout is empty.
+          if EXISTING_JSON=$(gh api "repos/$REPO/git/ref/tags/$TAG" 2>/dev/null); then
+            # The ref's object is either a commit (lightweight tag) or a tag
+            # object (annotated/signed). Dereference an annotated tag before
+            # comparing.
+            REF_TYPE=$(echo "$EXISTING_JSON" | node -p "JSON.parse(require('fs').readFileSync(0,'utf8')).object.type")
+            REF_OBJECT_SHA=$(echo "$EXISTING_JSON" | node -p "JSON.parse(require('fs').readFileSync(0,'utf8')).object.sha")
+            if [ "$REF_TYPE" = "tag" ]; then
+              EXISTING_SHA=$(gh api "repos/$REPO/git/tags/$REF_OBJECT_SHA" --jq '.object.sha')
+            else
+              EXISTING_SHA="$REF_OBJECT_SHA"
+            fi
+            if [ "$EXISTING_SHA" = "$PUBLISHED_SHA" ]; then
+              echo "Tag $TAG already exists at $PUBLISHED_SHA — no-op."
+              exit 0
+            fi
+            echo "::error::Tag $TAG exists at $EXISTING_SHA but this run's SHA is $PUBLISHED_SHA." >&2
+            echo "::error::That version is spent. Bump to the next patch instead of re-releasing it." >&2
+            exit 1
+          fi
+          gh api "repos/$REPO/git/refs" -X POST -f "ref=refs/tags/$TAG" -f "sha=$PUBLISHED_SHA"
+          echo "Created tag $TAG at $PUBLISHED_SHA"
+
+      # Create-as-draft then publish: immutable releases attest the locked
+      # asset set at publish time, so the release goes live in a separate
+      # `--draft=false` flip. That flip carries `--latest=false` — v1.x is the
+      # maintenance line and its releases never take the repository's Latest
+      # badge from the newer line. Re-runs skip a published release and flip a
+      # stranded draft live.
+      - name: Cut GitHub release (idempotent)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          IS_DRAFT=$(gh release view "$TAG" --repo "$REPO" --json isDraft --jq '.isDraft' 2>/dev/null || echo "absent")
+          if [ "$IS_DRAFT" = "false" ]; then
+            echo "Release $TAG already exists — no-op."
+            exit 0
+          fi
+          if [ "$IS_DRAFT" = "absent" ]; then
+            gh release create "$TAG" \
+              --repo "$REPO" \
+              --title "$TAG" \
+              --verify-tag \
+              --generate-notes \
+              --draft
+          fi
+          gh release edit "$TAG" --repo "$REPO" --draft=false --latest=false
+          echo "Published GitHub release $TAG"
+
+      # STAGED uploads: the tarball and its provenance land in npm's staging
+      # area and NOTHING is public until a human promotes each stage
+      # (`pnpm stage approve` with web 2FA, or the npm web UI). The
+      # per-package trusted publishers allow "stage publish" ONLY — a direct
+      # `npm publish` dies at the OIDC token exchange.
+      #
+      # Run from runner.temp against the pinned binary by absolute path: pnpm
+      # self-delegates to a packageManager pin whenever its cwd sits under a
+      # manifest, and the firewall shim guards inbound package fetches while
+      # a stage upload is outbound. This job has neither a checkout nor a
+      # shim, so both hazards are structurally absent.
+      - name: Stage all three packages
+        working-directory: ${{ runner.temp }}
+        env:
+          NPM_DIST_TAG: ${{ inputs.dist-tag }}
+        run: |
+          shopt -s nullglob
+          TARBALLS=("$RUNNER_TEMP"/dist/*.tgz)
+          if [ "${#TARBALLS[@]}" -ne 3 ]; then
+            echo "::error::Expected 3 verified tarballs, found ${#TARBALLS[@]}." >&2
+            exit 1
+          fi
+          for tarball in "${TARBALLS[@]}"; do
+            echo "Staging $(basename "$tarball")"
+            "${RUNNER_TEMP}/pnpm-bin/pnpm" stage publish "$tarball" \
+              --provenance \
+              --access public \
+              --tag "$NPM_DIST_TAG"
+          done
+          echo "All three packages staged. Promote each with: pnpm stage approve <id>"
+
+  # Derive the next version and write package.json + CHANGELOG.md. Runs the
+  # installed toolchain, so it holds no write credential. The bump leaves this
+  # job as a patch limited to those two files.
+  derive:
+    name: Derive the release bump
+    if: ${{ inputs.mode == 'release-pr' }}
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    outputs:
+      patch: ${{ steps.patch.outputs.patch }}
+      version: ${{ steps.bump.outputs.version }}
+
+    steps:
+      - *checkout-full-history
+      - *install-pnpm
+      - *install-node
+      - *download-sfw
+      - *create-sfw-shims
+      - *install-dependencies
+
+      - name: Bump version and changelog
+        id: bump
+        env:
+          RELEASE_AS: ${{ inputs.release-as }}
+        run: |
+          node scripts/release/bump.mts \
+            ${RELEASE_AS:+--release-as "$RELEASE_AS"} \
+            ${{ inputs.dry-run && '--dry-run' || '' }}
+
+      - name: Export the bump as a patch
+        if: ${{ inputs.dry-run == false }}
+        id: patch
+        run: |
+          echo "patch=$(git diff --binary HEAD -- CHANGELOG.md package.json | base64 -w0)" >> "$GITHUB_OUTPUT"
+          git diff --stat HEAD
+
+  # Commit the bump via the release App and open the release PR. This job
+  # installs nothing, so no third-party code shares a job with the App token.
+  release-pr:
+    name: Open the release PR
+    needs: derive
+    if: ${{ inputs.mode == 'release-pr' && inputs.dry-run == false }}
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    steps:
+      # The bump commit's parent is github.sha, so a shallow checkout of it is
+      # enough to apply the patch and read the base tree.
+      - name: Checkout source
+        shell: bash
+        env:
+          CHECKOUT_REF: ${{ github.sha }}
+          GITHUB_TOKEN: ${{ github.token }}
+          SERVER_URL: ${{ github.server_url }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          git init -q
+          git config --local advice.detachedHead false
+          git remote add origin "${SERVER_URL}/${REPOSITORY}"
+          AUTH_B64="$(printf 'x-access-token:%s' "$GITHUB_TOKEN" | base64 | tr -d '\n')"
+          export GIT_CONFIG_COUNT=1
+          export GIT_CONFIG_KEY_0="http.${SERVER_URL}/.extraheader"
+          export GIT_CONFIG_VALUE_0="AUTHORIZATION: basic ${AUTH_B64}"
+          git fetch --no-tags --depth=1 origin "$CHECKOUT_REF"
+          git checkout -q --detach FETCH_HEAD
+
+      - *install-node
+
+      - name: Apply the bump
+        env:
+          PATCH_B64: ${{ needs.derive.outputs.patch }}
+        run: printf '%s' "$PATCH_B64" | base64 -d | git apply
+
+      - name: Mint release App token
+        id: release-app
+        env:
+          APP_PRIVATE_KEY: ${{ secrets.SOCKET_RELEASE_APP_PRIVATE_KEY }}
+          CLIENT_ID: ${{ vars.SOCKET_RELEASE_CLIENT_ID }}
+          OWNER: ${{ github.repository_owner }}
+          PERMISSIONS: '{"contents":"write","pull_requests":"write"}'
+          REPOSITORIES: ${{ github.event.repository.name }}
+        run: node scripts/release/mint-app-token.mjs
+
+      - name: Commit the bump and open the release PR
+        env:
+          RELEASE_APP_TOKEN: ${{ steps.release-app.outputs.token }}
+          VERSION: ${{ needs.derive.outputs.version }}
+        run: node scripts/release/open-release-pr.mts --version "$VERSION"

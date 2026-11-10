@@ -1,21 +1,38 @@
+import { readdirSync } from 'node:fs'
 import path from 'node:path'
 
-import { joinAnd } from '@socketsecurity/registry/lib/arrays'
 import { logger } from '@socketsecurity/registry/lib/logger'
 
 import { assertValidExcludePaths } from './exclude-paths.mts'
+import {
+  generateUvMemberSboms,
+  resolveUvMemberDirs,
+} from './generate-uv-member-sboms.mts'
 import { handleCreateNewScan } from './handle-create-new-scan.mts'
 import { outputCreateNewScan } from './output-create-new-scan.mts'
-import { excludePathsFlag, reachabilityFlags } from './reachability-flags.mts'
+import { resolveReachAdvisories } from './reach-advisories.mts'
+import {
+  DYNAMIC_SBOM_INFERENCE_DESCRIPTION,
+  dynamicSbomInferenceEcosystemsFlags,
+  excludePathsFlag,
+  parseDynamicSbomInferenceFlags,
+  reachabilityFlags,
+} from './reachability-flags.mts'
+import {
+  isOmittedReachValue,
+  reachMemoryLimitToMb,
+} from './reachability-units.mts'
 import { suggestOrgSlug } from './suggest-org-slug.mts'
 import { suggestTarget } from './suggest_target.mts'
 import { validateReachabilityTarget } from './validate-reachability-target.mts'
+import { warnSocketJsonOnlyFlags } from './warn-socket-json-only-flags.mts'
 import constants, { REQUIREMENTS_TXT, SOCKET_JSON } from '../../constants.mts'
 import { commonFlags, outputFlags } from '../../flags.mts'
 import { checkCommandInput } from '../../utils/check-input.mts'
 import { cmdFlagValueToArray } from '../../utils/cmd.mts'
+import { isSocketFactsFile } from '../../utils/coana.mts'
 import { determineOrgSlug } from '../../utils/determine-org-slug.mts'
-import { getEcosystemChoicesForMeow } from '../../utils/ecosystem.mts'
+import { parseReachEcosystems } from '../../utils/ecosystem.mts'
 import { getOutputKind } from '../../utils/get-output-kind.mts'
 import {
   detectDefaultBranch,
@@ -34,13 +51,19 @@ import { detectManifestActions } from '../manifest/detect-manifest-actions.mts'
 
 import type { REPORT_LEVEL } from './types.mts'
 import type { MeowFlags } from '../../flags.mts'
-import type { PURL_Type } from '../../utils/ecosystem.mts'
 import type {
   CliCommandConfig,
   CliCommandContext,
 } from '../../utils/meow-with-subcommands.mts'
 
 export const CMD_NAME = 'create'
+
+// Accepted for backwards compatibility but forwarded nowhere, so passing one
+// must not imply --reach.
+const DEPRECATED_NO_OP_REACH_FLAGS = new Set([
+  'reachDisableAnalysisSplitting',
+  'reachLazyMode',
+])
 
 const description = 'Create a new Socket scan and report'
 
@@ -52,7 +75,7 @@ const generalFlags: MeowFlags = {
   autoManifest: {
     type: 'boolean',
     description:
-      'Run `socket manifest auto` before collecting manifest files. This is necessary for languages like Scala, Gradle, and Kotlin, See `socket manifest auto --help`.',
+      'Run `socket manifest auto` before collecting manifest files, which generates them for ecosystems that need their build tool to resolve dependencies, such as Scala, Gradle, and Kotlin. See `socket manifest auto --help`. For Gradle, sbt, Maven and .NET, --dynamic-sbom-inference generates a Socket facts SBOM per build root instead.',
   },
   branch: {
     type: 'string',
@@ -89,6 +112,12 @@ const generalFlags: MeowFlags = {
     description:
       'Set the default branch of the repository to the branch of this full-scan. Should only need to be done once, for example for the "main" or "master" branch.',
   },
+  dynamicSbomInference: {
+    type: 'boolean',
+    default: false,
+    description: `${DYNAMIC_SBOM_INFERENCE_DESCRIPTION} Combine with --reach to split the reachability analysis per project/module.`,
+  },
+  ...dynamicSbomInferenceEcosystemsFlags,
   interactive: {
     type: 'boolean',
     default: true,
@@ -110,7 +139,7 @@ const generalFlags: MeowFlags = {
   reach: {
     type: 'boolean',
     default: false,
-    description: 'Run tier 1 full application reachability analysis',
+    description: 'Run full application reachability analysis',
   },
   readOnly: {
     type: 'boolean',
@@ -153,6 +182,20 @@ const generalFlags: MeowFlags = {
       'Set the visibility (true/false) of the scan in your dashboard.',
     shortFlag: 't',
   },
+  uvMembers: {
+    type: 'boolean',
+    default: false,
+    description:
+      'Scan each TARGET directory as a uv project, using the versions pinned in its uv.lock or its workspace root uv.lock. Uploads a CycloneDX dependency graph per TARGET in place of manifest discovery, including all extras and dependency groups. Requires uv on PATH.',
+  },
+}
+
+function hasSocketFactsFileIn(dir: string): boolean {
+  try {
+    return readdirSync(dir).some(isSocketFactsFile)
+  } catch {
+    return false
+  }
 }
 
 export const cmdScanCreate = {
@@ -222,6 +265,7 @@ async function run(
       $ ${command}
       $ ${command} ./proj --json
       $ ${command} --repo=test-repo --branch=main ./package.json
+      $ ${command} --uv-members ./packages/api ./packages/worker
   `,
   }
 
@@ -255,9 +299,12 @@ async function run(
     reachDetailedAnalysisLogFile,
     reachDisableAnalysisSplitting: _reachDisableAnalysisSplitting,
     reachDisableAnalytics,
+    reachDisableDependencyDownloads,
     reachDisableExternalToolChecks,
     reachEnableAnalysisSplitting,
-    reachLazyMode,
+    reachFallbackToRegularScan,
+    reachLazyMode: _reachLazyMode,
+    reachRetainFactsFile,
     reachSkipCache,
     reachUseOnlyPregeneratedSboms,
     reachVersion,
@@ -282,8 +329,8 @@ async function run(
     tmp: boolean
     // Reachability flags.
     reach: boolean
-    reachAnalysisMemoryLimit: number
-    reachAnalysisTimeout: number
+    reachAnalysisMemoryLimit: string
+    reachAnalysisTimeout: string
     reachConcurrency: number
     reachContinueOnAnalysisErrors: boolean
     reachContinueOnInstallErrors: boolean
@@ -293,28 +340,28 @@ async function run(
     reachDetailedAnalysisLogFile: boolean
     reachDisableAnalysisSplitting: boolean
     reachDisableAnalytics: boolean
+    reachDisableDependencyDownloads: boolean
     reachDisableExternalToolChecks: boolean
     reachEnableAnalysisSplitting: boolean
+    reachFallbackToRegularScan: boolean
     reachLazyMode: boolean
+    reachRetainFactsFile: boolean
     reachSkipCache: boolean
     reachUseOnlyPregeneratedSboms: boolean
     reachVersion: string | undefined
   }
 
-  // Validate ecosystem values.
-  const reachEcosystems: PURL_Type[] = []
-  const reachEcosystemsRaw = cmdFlagValueToArray(cli.flags['reachEcosystems'])
-  const validEcosystems = getEcosystemChoicesForMeow()
-  for (const ecosystem of reachEcosystemsRaw) {
-    if (!validEcosystems.includes(ecosystem)) {
-      throw new Error(
-        `Invalid ecosystem: "${ecosystem}". Valid values are: ${joinAnd(validEcosystems)}`,
-      )
-    }
-    reachEcosystems.push(ecosystem as PURL_Type)
-  }
+  // Validate ecosystem values against the reachability-supported set.
+  const reachEcosystems = parseReachEcosystems(
+    cmdFlagValueToArray(cli.flags['reachEcosystems']),
+  )
+
+  const dynamicSbomInference = parseDynamicSbomInferenceFlags(cli.flags)
+
+  warnSocketJsonOnlyFlags(cli.flags, `${parentName} ${CMD_NAME}`)
 
   const dryRun = !!cli.flags['dryRun']
+  const uvMembers = !!cli.flags['uvMembers']
 
   let {
     autoManifest,
@@ -443,7 +490,19 @@ async function run(
   }
 
   const detected = await detectManifestActions(sockJson, cwd)
-  if (detected.count > 0 && !autoManifest) {
+  // Suppress the --auto-manifest suggestion when a Socket facts file is
+  // already present at cwd. That file is the output of `socket manifest auto`
+  // (and `--facts` mode of the per-ecosystem manifest commands), so suggesting
+  // to regenerate it would be misleading; the manifest data is already there
+  // and will be picked up by the scan.
+  const hasFactsFile = hasSocketFactsFileIn(cwd)
+  if (
+    detected.count > 0 &&
+    !autoManifest &&
+    !dynamicSbomInference &&
+    !uvMembers &&
+    !hasFactsFile
+  ) {
     logger.info(
       `Detected ${detected.count} manifest targets we could try to generate. Please set the --auto-manifest flag if you want to include languages covered by \`socket manifest auto\` in the Scan.`,
     )
@@ -470,44 +529,54 @@ async function run(
 
   const reachExcludePaths = cmdFlagValueToArray(cli.flags['reachExcludePaths'])
 
+  const reachAdvisoriesRaw = cmdFlagValueToArray(cli.flags['reachAdvisories'])
+
   // Validation helpers for better readability.
+  const hasReachAdvisories = reachAdvisoriesRaw.length > 0
+
   const hasReachEcosystems = reachEcosystems.length > 0
 
   const hasReachExcludePaths = reachExcludePaths.length > 0
 
+  // Compare by resolved magnitude, not string identity: 8192, 8192MB and 8GB
+  // all mean the default, and an omitted/zero timeout means "use the default".
+  // A naive string compare would flag those equivalents as non-default and
+  // wrongly require --reach.
+  const memoryLimitMb = reachMemoryLimitToMb(reachAnalysisMemoryLimit)
   const isUsingNonDefaultMemoryLimit =
-    reachAnalysisMemoryLimit !==
-    reachabilityFlags['reachAnalysisMemoryLimit']?.default
+    memoryLimitMb !== null &&
+    memoryLimitMb !==
+      reachMemoryLimitToMb(
+        String(reachabilityFlags['reachAnalysisMemoryLimit']?.default ?? ''),
+      )
 
-  const isUsingNonDefaultTimeout =
-    reachAnalysisTimeout !== reachabilityFlags['reachAnalysisTimeout']?.default
+  const isUsingNonDefaultTimeout = !isOmittedReachValue(reachAnalysisTimeout)
 
   const isUsingNonDefaultConcurrency =
     reachConcurrency !== reachabilityFlags['reachConcurrency']?.default
 
-  const isUsingNonDefaultAnalytics =
-    reachDisableAnalytics !==
-    reachabilityFlags['reachDisableAnalytics']?.default
-
   const isUsingNonDefaultVersion =
     reachVersion !== reachabilityFlags['reachVersion']?.default
 
+  // Compare every boolean reach flag against its declared default so newly
+  // added flags require --reach automatically instead of relying on a
+  // hand-maintained list. Deprecated no-ops are excluded on purpose.
+  const isUsingAnyBooleanReachFlag = Object.entries(reachabilityFlags).some(
+    ([name, flag]) =>
+      flag.type === 'boolean' &&
+      !DEPRECATED_NO_OP_REACH_FLAGS.has(name) &&
+      cli.flags[name] !== flag.default,
+  )
+
   const isUsingAnyReachabilityFlags =
+    hasReachAdvisories ||
     hasReachEcosystems ||
     hasReachExcludePaths ||
-    isUsingNonDefaultAnalytics ||
+    isUsingAnyBooleanReachFlag ||
     isUsingNonDefaultConcurrency ||
     isUsingNonDefaultMemoryLimit ||
     isUsingNonDefaultTimeout ||
-    isUsingNonDefaultVersion ||
-    reachContinueOnAnalysisErrors ||
-    reachContinueOnInstallErrors ||
-    reachContinueOnMissingLockFiles ||
-    reachContinueOnNoSourceFiles ||
-    reachEnableAnalysisSplitting ||
-    reachLazyMode ||
-    reachSkipCache ||
-    reachUseOnlyPregeneratedSboms
+    isUsingNonDefaultVersion
 
   // Validate target constraints when --reach is enabled.
   const reachTargetValidation = reach
@@ -531,6 +600,13 @@ async function run(
       test: !!targets.length,
       message: 'At least one TARGET (e.g. `.` or `./package.json`)',
       fail: 'missing',
+    },
+    {
+      nook: true,
+      test: !uvMembers || (!autoManifest && !dynamicSbomInference),
+      message:
+        '--uv-members cannot be combined with --auto-manifest or --dynamic-sbom-inference',
+      fail: 'select one source of generated SBOMs',
     },
     {
       nook: true,
@@ -594,10 +670,14 @@ async function run(
     return
   }
 
+  const uvMemberDirs = uvMembers ? resolveUvMemberDirs(targets, cwd) : undefined
+
   if (dryRun) {
     logger.log(constants.DRY_RUN_BAILING_NOW)
     return
   }
+
+  const reachAdvisories = await resolveReachAdvisories(reachAdvisoriesRaw)
 
   await handleCreateNewScan({
     autoManifest: Boolean(autoManifest),
@@ -607,15 +687,20 @@ async function run(
     committers: (committers && String(committers)) || '',
     cwd,
     defaultBranch: Boolean(defaultBranch),
+    generateScanFiles: uvMemberDirs
+      ? () => generateUvMemberSboms(uvMemberDirs)
+      : undefined,
     interactive: Boolean(interactive),
     orgSlug,
     outputKind,
     pendingHead: Boolean(pendingHead),
     pullRequest: Number(pullRequest),
     reach: {
+      dynamicSbomInference,
       excludePaths,
-      reachAnalysisMemoryLimit: Number(reachAnalysisMemoryLimit),
-      reachAnalysisTimeout: Number(reachAnalysisTimeout),
+      reachAdvisories,
+      reachAnalysisMemoryLimit,
+      reachAnalysisTimeout,
       reachConcurrency: Number(reachConcurrency),
       reachContinueOnAnalysisErrors: Boolean(reachContinueOnAnalysisErrors),
       reachContinueOnInstallErrors: Boolean(reachContinueOnInstallErrors),
@@ -624,11 +709,13 @@ async function run(
       reachDebug: Boolean(reachDebug),
       reachDetailedAnalysisLogFile: Boolean(reachDetailedAnalysisLogFile),
       reachDisableAnalytics: Boolean(reachDisableAnalytics),
+      reachDisableDependencyDownloads: Boolean(reachDisableDependencyDownloads),
       reachDisableExternalToolChecks: Boolean(reachDisableExternalToolChecks),
       reachEcosystems,
       reachEnableAnalysisSplitting: Boolean(reachEnableAnalysisSplitting),
       reachExcludePaths,
-      reachLazyMode: Boolean(reachLazyMode),
+      reachFallbackToRegularScan: Boolean(reachFallbackToRegularScan),
+      reachRetainFactsFile: Boolean(reachRetainFactsFile),
       reachSkipCache: Boolean(reachSkipCache),
       reachUseOnlyPregeneratedSboms: Boolean(reachUseOnlyPregeneratedSboms),
       reachVersion,

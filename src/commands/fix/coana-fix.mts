@@ -19,6 +19,7 @@ import {
   getCiEnvInstructions,
   getFixEnv,
 } from './env-helpers.mts'
+import { generateSocketFactsForFix } from './generated-socket-facts.mts'
 import { getSocketFixBranchName, getSocketFixCommitMessage } from './git.mts'
 import { getSocketFixPrs, openSocketFixPr } from './pull-request.mts'
 import {
@@ -27,8 +28,14 @@ import {
   GQL_PR_STATE_OPEN,
 } from '../../constants.mts'
 import { handleApiCall } from '../../utils/api.mts'
-import { spawnCoanaDlx } from '../../utils/dlx.mts'
+import { spawnCoana } from '../../utils/coana-release.mts'
+import {
+  isReachabilityReportPath,
+  isSocketFactsFile,
+} from '../../utils/coana.mts'
+import { findSocketYmlSync } from '../../utils/config.mts'
 import { getErrorCause } from '../../utils/errors.mts'
+import { withTmpDir } from '../../utils/fs.mts'
 import {
   gitCheckoutBranch,
   gitCommit,
@@ -38,19 +45,22 @@ import {
   gitRemoteBranchExists,
   gitResetAndClean,
   gitUnstagedModifiedFiles,
+  gitUntrackedFiles,
 } from '../../utils/git.mts'
 import {
   enablePrAutoMerge,
   fetchGhsaDetails,
   setGitRemoteGithubRepoUrl,
 } from '../../utils/github.mts'
-import { findSocketYmlSync } from '../../utils/config.mts'
 import { getPackageFilesForScan } from '../../utils/path-resolve.mts'
 import { setupSdk } from '../../utils/sdk.mts'
+import { excludePathToScanIgnores } from '../scan/exclude-paths.mts'
 import { fetchSupportedScanFileNames } from '../scan/fetch-supported-scan-file-names.mts'
 
+import type { GeneratedSocketFacts } from './generated-socket-facts.mts'
 import type { FixConfig } from './types.mts'
 import type { CResult } from '../../types.mts'
+import type { FactsOnlyTypes } from '../../utils/coana.mts'
 import type { PURL_Type } from '../../utils/ecosystem.mts'
 import type { Spinner } from '@socketsecurity/registry/lib/spinner'
 
@@ -58,9 +68,71 @@ type DiscoverGhsaIdsOptions = {
   coanaVersion?: string | undefined
   cwd?: string | undefined
   ecosystems?: PURL_Type[] | undefined
+  factsFlags?: string[] | undefined
   packageManagers?: string[] | undefined
   silence?: boolean | undefined
   spinner?: Spinner | undefined
+}
+
+type StructuredDiscoveryResult = {
+  ghsaIds?: unknown
+  artifactCount?: unknown
+  filteredArtifactCount?: unknown
+}
+
+async function readStructuredDiscoveryResult(
+  outputFile: string,
+  silence: boolean,
+): Promise<CResult<string[]>> {
+  let raw: string
+  try {
+    raw = await fs.readFile(outputFile, 'utf8')
+  } catch {
+    return {
+      ok: false,
+      message: 'Coana did not write a vulnerability discovery result file',
+      cause: `Expected \`find-vulnerabilities --output-file\` to create ${outputFile}.`,
+    }
+  }
+
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(raw)
+  } catch {
+    return {
+      ok: false,
+      message:
+        'Could not parse the vulnerability discovery result written by Coana',
+      cause: `Expected JSON in ${outputFile}, got:\n  ${raw.slice(0, 500)}`,
+    }
+  }
+
+  if (parsed === null || typeof parsed !== 'object') {
+    return {
+      ok: false,
+      message: 'Coana wrote an unexpected vulnerability discovery result',
+      cause: `Expected a JSON object with a ghsaIds string array, got:\n  ${raw.slice(0, 500)}`,
+    }
+  }
+
+  const { artifactCount, ghsaIds } = parsed as StructuredDiscoveryResult
+  if (!Array.isArray(ghsaIds) || ghsaIds.some(id => typeof id !== 'string')) {
+    return {
+      ok: false,
+      message: 'Coana wrote an unexpected vulnerability discovery result',
+      cause: `Expected a JSON object with a ghsaIds string array, got:\n  ${raw.slice(0, 500)}`,
+    }
+  }
+
+  // Zero artifacts means the backend resolved nothing — suspicious when
+  // manifests were uploaded, so warn even though discovery itself succeeded.
+  if (artifactCount === 0 && !silence) {
+    logger.warn(
+      'The Socket backend resolved 0 artifacts, so vulnerability discovery may be incomplete.',
+    )
+  }
+
+  return { ok: true, data: ghsaIds }
 }
 
 /**
@@ -71,10 +143,11 @@ async function discoverGhsaIds(
   orgSlug: string,
   tarHash: string,
   options?: DiscoverGhsaIdsOptions | undefined,
-): Promise<string[]> {
+): Promise<CResult<string[]>> {
   const {
     cwd = process.cwd(),
     ecosystems,
+    factsFlags = [],
     packageManagers,
     silence = false,
     spinner,
@@ -83,43 +156,160 @@ async function discoverGhsaIds(
     ...options,
   } as DiscoverGhsaIdsOptions
 
-  const foundCResult = await spawnCoanaDlx(
+  // Coana writes a structured JSON result ({ ghsaIds, artifactCount,
+  // filteredArtifactCount }) via --output-file (available since coana 15.9.7,
+  // older than the pinned @coana-tech/cli version).
+  const outputFile = path.join(
+    os.tmpdir(),
+    `socket-fix-discovery-${Date.now()}.json`,
+  )
+
+  const foundCResult = await spawnCoana(
     [
       'find-vulnerabilities',
       cwd,
       '--manifests-tar-hash',
       tarHash,
+      '--output-file',
+      outputFile,
       ...(ecosystems?.length ? ['--purl-types', ...ecosystems] : []),
       ...(packageManagers?.length
         ? ['--package-managers', ...packageManagers]
         : []),
+      ...factsFlags,
     ],
     orgSlug,
     {
       cwd,
       spinner: silence ? undefined : spinner,
       coanaVersion: options?.coanaVersion,
+      stdio: 'pipe',
     },
-    { stdio: 'pipe' },
   )
 
-  if (foundCResult.ok) {
-    try {
-      // Coana prints ghsaIds as json-formatted string on the final line of the output.
-      const ghsaIdsRaw = foundCResult.data.trim().split('\n').pop()
-      if (ghsaIdsRaw) {
-        return JSON.parse(ghsaIdsRaw)
-      }
-    } catch {}
+  if (!foundCResult.ok) {
+    await fs.rm(outputFile, { force: true }).catch(() => {})
+    return foundCResult
   }
-  return []
+
+  try {
+    return await readStructuredDiscoveryResult(outputFile, silence)
+  } finally {
+    await fs.rm(outputFile, { force: true }).catch(() => {})
+  }
 }
 
-export async function coanaFix(
+type GitWorkingTreeChanges = {
+  modified: string[]
+  untracked: string[]
+}
+
+async function gitWorkingTreeChanges(
+  cwd: string,
+): Promise<GitWorkingTreeChanges> {
+  const { 0: modifiedCResult, 1: untrackedCResult } = await Promise.all([
+    gitUnstagedModifiedFiles(cwd),
+    gitUntrackedFiles(cwd),
+  ])
+  return {
+    modified: modifiedCResult.ok ? modifiedCResult.data : [],
+    untracked: untrackedCResult.ok ? untrackedCResult.data : [],
+  }
+}
+
+// Coana's modifiedFiles may under-report; untracked files still need it or a
+// manifest name, so build output in repos without a .gitignore stays out.
+function selectFixedFiles(
+  before: GitWorkingTreeChanges,
+  after: GitWorkingTreeChanges,
+  writtenFiles: Set<string> | undefined,
+  scanBaseNames: Set<string>,
+): string[] {
+  const dirtyBefore = new Set([...before.modified, ...before.untracked])
+  const isFromFix = (relPath: string) =>
+    !!writtenFiles?.has(relPath) || !dirtyBefore.has(relPath)
+  return [
+    ...after.modified.filter(isFromFix),
+    ...after.untracked.filter(
+      relPath =>
+        isFromFix(relPath) &&
+        (!!writtenFiles?.has(relPath) ||
+          scanBaseNames.has(path.basename(relPath))),
+    ),
+  ]
+}
+
+function readWrittenFiles(outputFile: string): Set<string> | undefined {
+  const result = readJsonSync(outputFile, { throws: false }) as
+    | { modifiedFiles?: unknown }
+    | null
+    | undefined
+  const files = result?.modifiedFiles
+  return Array.isArray(files) && files.every(f => typeof f === 'string')
+    ? new Set(files)
+    : undefined
+}
+
+type CoanaFixResult = CResult<{ fixedAll: boolean; ghsaDetails: unknown[] }>
+
+// Coana exits with this code after writing an --output-file that lists computed fixes it left unapplied.
+// Local mode exits with it too, so automation can tell unapplied fixes from a failed run.
+const COANA_FIXES_NOT_APPLIED_EXIT_CODE = 5
+
+type NotAppliedFix = {
+  ghsa: string
+  purl: string
+  fixedVersion: string
+  reason: string
+}
+
+function isFixesNotAppliedExit(result: CResult<unknown>): boolean {
+  return (
+    !result.ok &&
+    (result.data as any)?.code === COANA_FIXES_NOT_APPLIED_EXIT_CODE
+  )
+}
+
+function readNotAppliedFixes(fixesResultJson: unknown): NotAppliedFix[] {
+  const notApplied = (fixesResultJson as { notApplied?: unknown } | null)
+    ?.notApplied
+  return Array.isArray(notApplied) ? (notApplied as NotAppliedFix[]) : []
+}
+
+function formatNotAppliedFixes(notApplied: NotAppliedFix[]): string {
+  return notApplied
+    .map(f => `  ${f.ghsa}: ${f.purl} -> ${f.fixedVersion}: ${f.reason}`)
+    .join('\n')
+}
+
+type GeneratedSocketFactsSlot = {
+  generated?: GeneratedSocketFacts | undefined
+  purlTypes: FactsOnlyTypes
+  tmpDir: string
+}
+
+export async function coanaFix(fixConfig: FixConfig): Promise<CoanaFixResult> {
+  const purlTypes = fixConfig.dynamicSbomInference
+  if (!purlTypes) {
+    return await coanaFixWithFacts(fixConfig, undefined)
+  }
+  return await withTmpDir('socket-fix-facts-', async tmpDir => {
+    const slot: GeneratedSocketFactsSlot = { purlTypes, tmpDir }
+    try {
+      return await coanaFixWithFacts(fixConfig, slot)
+    } finally {
+      await slot.generated?.remove()
+    }
+  })
+}
+
+async function coanaFixWithFacts(
   fixConfig: FixConfig,
-): Promise<CResult<{ fixedAll: boolean; ghsaDetails: unknown[] }>> {
+  factsSlot: GeneratedSocketFactsSlot | undefined,
+): Promise<CoanaFixResult> {
   const {
     all,
+    allowOverrides,
     applyFixes,
     autopilot,
     coanaVersion,
@@ -129,6 +319,7 @@ export async function coanaFix(
     disableMajorUpdates,
     ecosystems,
     exclude,
+    excludePaths,
     ghsas,
     include,
     minimumReleaseAge,
@@ -156,6 +347,7 @@ export async function coanaFix(
   const sockSdk = sockSdkCResult.data
 
   const supportedFilesCResult = await fetchSupportedScanFileNames({
+    orgSlug,
     spinner: silence ? undefined : spinner,
     silence,
   })
@@ -171,29 +363,66 @@ export async function coanaFix(
     ? socketYmlResult.data?.parsed
     : undefined
 
-  const scanFilepaths = await getPackageFilesForScan(['.'], supportedFiles, {
-    config: socketConfig,
-    cwd,
-  })
-  // Fail if any .socket.facts.json files are present in the scan folder.
-  // These are analysis artifacts and must be removed before re-running fix.
-  const factsFiles = scanFilepaths.filter(
-    p => path.basename(p).toLowerCase() === DOT_SOCKET_DOT_FACTS_JSON,
-  )
-  if (factsFiles.length) {
+  // Expand user-supplied `--exclude-paths` patterns into the fast-glob ignore
+  // form so manifest discovery skips them. Without this an unreadable
+  // subdirectory (e.g. a postgres `pgdata` owned by another uid) would crash
+  // `socket fix` before coana is even invoked.
+  const additionalIgnores = excludePaths.length
+    ? excludePaths.flatMap(excludePathToScanIgnores)
+    : undefined
+  // Forward --exclude-paths to coana's workspace filter too, so a workspace
+  // matching the pattern is also skipped during fix application even when
+  // its manifest somehow made it into the upload (e.g. picked up via a
+  // sibling manifest's references). --exclude stays separate as a hidden
+  // legacy escape hatch for the narrower "fix-application only" semantic.
+  const coanaExcludePatterns = [...exclude, ...excludePaths]
+  const findScanFilepaths = async () =>
+    (
+      await getPackageFilesForScan(['.'], supportedFiles, {
+        additionalIgnores,
+        config: socketConfig,
+        cwd,
+      })
+    ).filter(
+      p =>
+        !isReachabilityReportPath(p, {
+          cwd,
+          outputPath: DOT_SOCKET_DOT_FACTS_JSON,
+        }),
+    )
+  const scanFilepaths = await findScanFilepaths()
+  if (factsSlot) {
     if (!silence) {
       spinner?.stop()
+      logger.info('Generating Socket facts for each build ...')
     }
-    return {
-      ok: false,
-      message: `Found ${DOT_SOCKET_DOT_FACTS_JSON} in manifest files`,
-      cause:
-        `Delete the following ${pluralize('file', factsFiles.length)} before running socket fix again:\n` +
-        factsFiles.map(p => `  - ${p}`).join('\n'),
+    factsSlot.generated = await generateSocketFactsForFix({
+      cwd,
+      excludePaths,
+      purlTypes: factsSlot.purlTypes,
+      findFactsPaths: async () =>
+        (await findScanFilepaths()).filter(isSocketFactsFile),
+      tmpDir: factsSlot.tmpDir,
+    })
+    const known = new Set(scanFilepaths)
+    scanFilepaths.push(...factsSlot.generated.paths.filter(p => !known.has(p)))
+    if (!silence) {
+      spinner?.start()
     }
   }
+  const sidecarFile = factsSlot?.generated?.sidecarFile
+  // Discovery only needs which artifacts the facts files resolve. Applying
+  // fixes reads each project's tree; a Coana predating facts trees can only
+  // tell from the sidecar's classpaths which projects resolve an artifact.
+  const discoveryFlags = factsSlot?.generated?.artifactsFlags ?? []
+  const factsFlags = [
+    ...discoveryFlags,
+    ...(sidecarFile ? ['--compute-artifacts-sidecar', sidecarFile] : []),
+  ]
   const uploadCResult = await handleApiCall(
-    sockSdk.uploadManifestFiles(orgSlug, scanFilepaths, cwd),
+    sockSdk.uploadManifestFiles(orgSlug, scanFilepaths, {
+      pathsRelativeTo: cwd,
+    }),
     {
       description: 'upload manifests',
       spinner,
@@ -251,16 +480,27 @@ export async function coanaFix(
     }
 
     // In local mode, process all discovered/provided IDs (no limit).
-    const ids: string[] = shouldDiscoverGhsaIds
-      ? await discoverGhsaIds(orgSlug, tarHash, {
-          coanaVersion,
-          cwd,
-          ecosystems,
-          packageManagers,
-          silence,
-          spinner,
-        })
-      : ghsas
+    let ids: string[]
+    if (shouldDiscoverGhsaIds) {
+      const discoverCResult = await discoverGhsaIds(orgSlug, tarHash, {
+        coanaVersion,
+        cwd,
+        ecosystems,
+        factsFlags: discoveryFlags,
+        packageManagers,
+        silence,
+        spinner,
+      })
+      if (!discoverCResult.ok) {
+        if (!silence) {
+          spinner?.stop()
+        }
+        return discoverCResult
+      }
+      ids = discoverCResult.data
+    } else {
+      ids = ghsas
+    }
 
     if (ids.length === 0) {
       if (!silence) {
@@ -274,7 +514,7 @@ export async function coanaFix(
     const tmpFile = path.join(tmpDir, `socket-fix-${Date.now()}.json`)
 
     try {
-      const fixCResult = await spawnCoanaDlx(
+      const fixCResult = await spawnCoana(
         [
           'compute-fixes-and-upgrade-purls',
           cwd,
@@ -289,11 +529,14 @@ export async function coanaFix(
             ? ['--minimum-release-age', minimumReleaseAge]
             : []),
           ...(include.length ? ['--include', ...include] : []),
-          ...(exclude.length ? ['--exclude', ...exclude] : []),
+          ...(coanaExcludePatterns.length
+            ? ['--exclude', ...coanaExcludePatterns]
+            : []),
           ...(ecosystems.length ? ['--purl-types', ...ecosystems] : []),
           ...(packageManagers.length
             ? ['--package-managers', ...packageManagers]
             : []),
+          ...factsFlags,
           ...(!applyFixes ? [FLAG_DRY_RUN] : []),
           '--output-file',
           tmpFile,
@@ -302,6 +545,7 @@ export async function coanaFix(
             ? ['--disable-external-tool-checks']
             : []),
           ...(disableMajorUpdates ? ['--disable-major-updates'] : []),
+          ...(allowOverrides ? ['--allow-overrides'] : []),
           ...(showAffectedDirectDependencies
             ? ['--show-affected-direct-dependencies']
             : []),
@@ -320,13 +564,13 @@ export async function coanaFix(
         spinner?.stop()
       }
 
-      if (!fixCResult.ok) {
+      if (!fixCResult.ok && !isFixesNotAppliedExit(fixCResult)) {
         return fixCResult
       }
 
       // Read the temporary file to get the actual fixes result.
       const fixesResultJson = readJsonSync(tmpFile, { throws: false }) as
-        | { fixes?: Record<string, unknown> }
+        | { type?: string; fixes?: Record<string, unknown> }
         | null
         | undefined
 
@@ -339,12 +583,24 @@ export async function coanaFix(
         await fs.writeFile(outputFile, tmpContent, 'utf8')
       }
 
+      const ghsaDetails = fixesResultJson ? [fixesResultJson] : []
+      const notApplied = readNotAppliedFixes(fixesResultJson)
+      if (!fixCResult.ok || notApplied.length) {
+        return {
+          ok: false,
+          code: COANA_FIXES_NOT_APPLIED_EXIT_CODE,
+          message:
+            fixesResultJson?.type === 'no-fixes-applied'
+              ? 'No computed fixes were applied'
+              : 'Some computed fixes were not applied',
+          cause: formatNotAppliedFixes(notApplied),
+          data: { fixedAll: false, ghsaDetails },
+        }
+      }
+
       return {
         ok: true,
-        data: {
-          fixedAll: true,
-          ghsaDetails: fixesResultJson ? [fixesResultJson] : [],
-        },
+        data: { fixedAll: true, ghsaDetails },
       }
     } finally {
       // Clean up the temporary file.
@@ -385,18 +641,26 @@ export async function coanaFix(
   let ids: string[] | undefined
 
   if (shouldSpawnCoana) {
-    ids = (
-      shouldDiscoverGhsaIds
-        ? await discoverGhsaIds(orgSlug, tarHash, {
-            coanaVersion,
-            cwd,
-            ecosystems,
-            packageManagers,
-            silence,
-            spinner,
-          })
-        : ghsas
-    ).slice(0, adjustedPrLimit)
+    if (shouldDiscoverGhsaIds) {
+      const discoverCResult = await discoverGhsaIds(orgSlug, tarHash, {
+        coanaVersion,
+        cwd,
+        ecosystems,
+        factsFlags: discoveryFlags,
+        packageManagers,
+        silence,
+        spinner,
+      })
+      if (!discoverCResult.ok) {
+        if (!silence) {
+          spinner?.stop()
+        }
+        return discoverCResult
+      }
+      ids = discoverCResult.data.slice(0, adjustedPrLimit)
+    } else {
+      ids = ghsas.slice(0, adjustedPrLimit)
+    }
   }
 
   if (!ids?.length) {
@@ -430,13 +694,20 @@ export async function coanaFix(
     const ghsaId = ids[i]!
     debugFn('notice', `check: ${ghsaId}`)
 
+    // Resetting to the base branch cleans the untracked facts files away.
+    // eslint-disable-next-line no-await-in-loop
+    await factsSlot?.generated?.restore()
+
+    // eslint-disable-next-line no-await-in-loop
+    const changesBefore = await gitWorkingTreeChanges(cwd)
+
     // Create a temporary file for Coana output.
     const tmpDir = os.tmpdir()
     const tmpFile = path.join(tmpDir, `socket-fix-${ghsaId}-${Date.now()}.json`)
 
     // Apply fix for single GHSA ID.
     // eslint-disable-next-line no-await-in-loop
-    const fixCResult = await spawnCoanaDlx(
+    const fixCResult = await spawnCoana(
       [
         'compute-fixes-and-upgrade-purls',
         cwd,
@@ -451,16 +722,20 @@ export async function coanaFix(
           ? ['--minimum-release-age', minimumReleaseAge]
           : []),
         ...(include.length ? ['--include', ...include] : []),
-        ...(exclude.length ? ['--exclude', ...exclude] : []),
+        ...(coanaExcludePatterns.length
+          ? ['--exclude', ...coanaExcludePatterns]
+          : []),
         ...(ecosystems.length ? ['--purl-types', ...ecosystems] : []),
         ...(packageManagers.length
           ? ['--package-managers', ...packageManagers]
           : []),
+        ...factsFlags,
         ...(debug ? ['--debug'] : []),
         ...(disableExternalToolChecks
           ? ['--disable-external-tool-checks']
           : []),
         ...(disableMajorUpdates ? ['--disable-major-updates'] : []),
+        ...(allowOverrides ? ['--allow-overrides'] : []),
         ...(showAffectedDirectDependencies
           ? ['--show-affected-direct-dependencies']
           : []),
@@ -477,7 +752,13 @@ export async function coanaFix(
       },
     )
 
-    if (!fixCResult.ok) {
+    if (isFixesNotAppliedExit(fixCResult)) {
+      if (!silence) {
+        logger.warn(
+          `Not every fix for ${ghsaId} was applied:\n${formatNotAppliedFixes(readNotAppliedFixes(readJsonSync(tmpFile, { throws: false })))}`,
+        )
+      }
+    } else if (!fixCResult.ok) {
       if (!silence) {
         logger.error(
           `Update failed for ${ghsaId}: ${getErrorCause(fixCResult)}`,
@@ -493,14 +774,13 @@ export async function coanaFix(
       continue ghsaLoop
     }
 
-    // Check for modified files after applying the fix.
-    // eslint-disable-next-line no-await-in-loop
-    const unstagedCResult = await gitUnstagedModifiedFiles(cwd)
-    const modifiedFiles = unstagedCResult.ok
-      ? unstagedCResult.data.filter(relPath =>
-          scanBaseNames.has(path.basename(relPath)),
-        )
-      : []
+    const modifiedFiles = selectFixedFiles(
+      changesBefore,
+      // eslint-disable-next-line no-await-in-loop
+      await gitWorkingTreeChanges(cwd),
+      readWrittenFiles(tmpFile),
+      scanBaseNames,
+    )
 
     if (!modifiedFiles.length) {
       debugFn('notice', `skip: no changes for ${ghsaId}`)

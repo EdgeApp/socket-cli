@@ -18,6 +18,7 @@
  */
 
 import { promises as fs } from 'node:fs'
+import { tmpdir } from 'node:os'
 import path from 'node:path'
 
 import constants from '../constants.mts'
@@ -65,4 +66,27 @@ export async function findUp(
     dir = path.dirname(dir)
   }
   return undefined
+}
+
+export async function withTmpDir<T>(
+  prefix: string,
+  fn: (tmpDir: string) => Promise<T>,
+): Promise<T> {
+  const tmpDir = await fs.mkdtemp(path.join(tmpdir(), prefix))
+  try {
+    return await fn(tmpDir)
+  } finally {
+    await fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {})
+  }
+}
+
+// Symlink-resolved absolute path when the target exists (e.g. macOS symlinks
+// /tmp -> /private/tmp); falls back to a plain resolve so a not-yet-existing
+// path still gets a usable absolute value instead of throwing.
+export async function realpathOrResolved(target: string): Promise<string> {
+  try {
+    return await fs.realpath(target)
+  } catch {
+    return path.resolve(target)
+  }
 }

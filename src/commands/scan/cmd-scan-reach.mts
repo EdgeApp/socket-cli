@@ -1,19 +1,26 @@
 import path from 'node:path'
 
-import { joinAnd } from '@socketsecurity/registry/lib/arrays'
 import { logger } from '@socketsecurity/registry/lib/logger'
 
 import { assertValidExcludePaths } from './exclude-paths.mts'
 import { handleScanReach } from './handle-scan-reach.mts'
-import { excludePathsFlag, reachabilityFlags } from './reachability-flags.mts'
+import { resolveReachAdvisories } from './reach-advisories.mts'
+import {
+  DYNAMIC_SBOM_INFERENCE_DESCRIPTION,
+  dynamicSbomInferenceEcosystemsFlags,
+  excludePathsFlag,
+  parseDynamicSbomInferenceFlags,
+  reachabilityFlags,
+} from './reachability-flags.mts'
 import { suggestTarget } from './suggest_target.mts'
 import { validateReachabilityTarget } from './validate-reachability-target.mts'
+import { warnSocketJsonOnlyFlags } from './warn-socket-json-only-flags.mts'
 import constants from '../../constants.mts'
 import { commonFlags, outputFlags } from '../../flags.mts'
 import { checkCommandInput } from '../../utils/check-input.mts'
 import { cmdFlagValueToArray } from '../../utils/cmd.mts'
 import { determineOrgSlug } from '../../utils/determine-org-slug.mts'
-import { getEcosystemChoicesForMeow } from '../../utils/ecosystem.mts'
+import { parseReachEcosystems } from '../../utils/ecosystem.mts'
 import { getOutputKind } from '../../utils/get-output-kind.mts'
 import { meowOrExit } from '../../utils/meow-with-subcommands.mts'
 import {
@@ -23,7 +30,6 @@ import {
 import { hasDefaultApiToken } from '../../utils/sdk.mts'
 
 import type { MeowFlags } from '../../flags.mts'
-import type { PURL_Type } from '../../utils/ecosystem.mts'
 import type {
   CliCommandConfig,
   CliCommandContext,
@@ -31,9 +37,30 @@ import type {
 
 export const CMD_NAME = 'reach'
 
-const description = 'Compute tier 1 reachability'
+const description = 'Compute full application reachability'
 
-const hidden = true
+const hidden = false
+
+// Not in reachabilityFlags: on `scan create` it is a general flag the --reach
+// guard must not reject. Reachability is always on here, so the description
+// drops that command's --reach caveat.
+const reachabilityFlagsForReach: MeowFlags = {
+  ...reachabilityFlags,
+  dynamicSbomInference: {
+    type: 'boolean',
+    default: false,
+    description: `${DYNAMIC_SBOM_INFERENCE_DESCRIPTION} The reachability analysis is split per project/module accordingly.`,
+  },
+  ...dynamicSbomInferenceEcosystemsFlags,
+  // Fallback targets scan creation, which this command never performs.
+  reachFallbackToRegularScan: {
+    type: 'boolean',
+    default: false,
+    hidden: true,
+    description:
+      'No-op: only `socket scan create --reach` falls back to a regular SCA scan on reachability failure.',
+  },
+}
 
 const generalFlags: MeowFlags = {
   ...commonFlags,
@@ -76,7 +103,7 @@ async function run(
     flags: {
       ...generalFlags,
       ...excludePathsFlag,
-      ...reachabilityFlags,
+      ...reachabilityFlagsForReach,
     },
     help: command =>
       `
@@ -90,7 +117,7 @@ async function run(
       ${getFlagListOutput(generalFlags)}
 
     Reachability Options
-      ${getFlagListOutput({ ...excludePathsFlag, ...reachabilityFlags })}
+      ${getFlagListOutput({ ...excludePathsFlag, ...reachabilityFlagsForReach })}
 
     Runs the Socket reachability analysis without creating a scan in Socket.
     The output is written to .socket.facts.json in the current working directory
@@ -104,6 +131,7 @@ async function run(
       $ ${command}
       $ ${command} ./proj
       $ ${command} ./proj --reach-ecosystems npm,pypi
+      $ ${command} ./monorepo --dynamic-sbom-inference
       $ ${command} --output custom-report.json
       $ ${command} ./proj --output ./reports/analysis.json
   `,
@@ -115,6 +143,8 @@ async function run(
     importMeta,
     parentName,
   })
+
+  warnSocketJsonOnlyFlags(cli.flags, `${parentName} ${CMD_NAME}`)
 
   const {
     cwd: cwdOverride,
@@ -134,9 +164,11 @@ async function run(
     reachDetailedAnalysisLogFile,
     reachDisableAnalysisSplitting: _reachDisableAnalysisSplitting,
     reachDisableAnalytics,
+    reachDisableDependencyDownloads,
     reachDisableExternalToolChecks,
     reachEnableAnalysisSplitting,
-    reachLazyMode,
+    reachLazyMode: _reachLazyMode,
+    reachRetainFactsFile,
     reachSkipCache,
     reachUseOnlyPregeneratedSboms,
     reachVersion,
@@ -147,8 +179,8 @@ async function run(
     markdown: boolean
     org: string
     output: string
-    reachAnalysisMemoryLimit: number
-    reachAnalysisTimeout: number
+    reachAnalysisMemoryLimit: string
+    reachAnalysisTimeout: string
     reachConcurrency: number
     reachContinueOnAnalysisErrors: boolean
     reachContinueOnInstallErrors: boolean
@@ -158,9 +190,11 @@ async function run(
     reachDetailedAnalysisLogFile: boolean
     reachDisableAnalysisSplitting: boolean
     reachDisableAnalytics: boolean
+    reachDisableDependencyDownloads: boolean
     reachDisableExternalToolChecks: boolean
     reachEnableAnalysisSplitting: boolean
     reachLazyMode: boolean
+    reachRetainFactsFile: boolean
     reachSkipCache: boolean
     reachUseOnlyPregeneratedSboms: boolean
     reachVersion: string | undefined
@@ -170,21 +204,14 @@ async function run(
 
   // Process comma-separated values for isMultiple flags.
   const excludePaths = cmdFlagValueToArray(cli.flags['excludePaths'])
+  const reachAdvisoriesRaw = cmdFlagValueToArray(cli.flags['reachAdvisories'])
   const reachEcosystemsRaw = cmdFlagValueToArray(cli.flags['reachEcosystems'])
   const reachExcludePaths = cmdFlagValueToArray(cli.flags['reachExcludePaths'])
   assertValidExcludePaths(excludePaths)
 
-  // Validate ecosystem values.
-  const reachEcosystems: PURL_Type[] = []
-  const validEcosystems = getEcosystemChoicesForMeow()
-  for (const ecosystem of reachEcosystemsRaw) {
-    if (!validEcosystems.includes(ecosystem)) {
-      throw new Error(
-        `Invalid ecosystem: "${ecosystem}". Valid values are: ${joinAnd(validEcosystems)}`,
-      )
-    }
-    reachEcosystems.push(ecosystem as PURL_Type)
-  }
+  // Validate ecosystem values against the reachability-supported set.
+  const reachEcosystems = parseReachEcosystems(reachEcosystemsRaw)
+  const dynamicSbomInference = parseDynamicSbomInferenceFlags(cli.flags)
 
   const processCwd = process.cwd()
   const cwd =
@@ -269,6 +296,8 @@ async function run(
     return
   }
 
+  const reachAdvisories = await resolveReachAdvisories(reachAdvisoriesRaw)
+
   await handleScanReach({
     cwd,
     interactive,
@@ -276,9 +305,11 @@ async function run(
     outputKind,
     outputPath: outputPath || '',
     reachabilityOptions: {
+      dynamicSbomInference,
       excludePaths,
-      reachAnalysisMemoryLimit: Number(reachAnalysisMemoryLimit),
-      reachAnalysisTimeout: Number(reachAnalysisTimeout),
+      reachAdvisories,
+      reachAnalysisMemoryLimit,
+      reachAnalysisTimeout,
       reachConcurrency: Number(reachConcurrency),
       reachContinueOnAnalysisErrors: Boolean(reachContinueOnAnalysisErrors),
       reachContinueOnInstallErrors: Boolean(reachContinueOnInstallErrors),
@@ -287,11 +318,12 @@ async function run(
       reachDebug: Boolean(reachDebug),
       reachDetailedAnalysisLogFile: Boolean(reachDetailedAnalysisLogFile),
       reachDisableAnalytics: Boolean(reachDisableAnalytics),
+      reachDisableDependencyDownloads: Boolean(reachDisableDependencyDownloads),
       reachDisableExternalToolChecks: Boolean(reachDisableExternalToolChecks),
       reachEcosystems,
       reachEnableAnalysisSplitting: Boolean(reachEnableAnalysisSplitting),
       reachExcludePaths,
-      reachLazyMode: Boolean(reachLazyMode),
+      reachRetainFactsFile: Boolean(reachRetainFactsFile),
       reachSkipCache: Boolean(reachSkipCache),
       reachUseOnlyPregeneratedSboms: Boolean(reachUseOnlyPregeneratedSboms),
       reachVersion,

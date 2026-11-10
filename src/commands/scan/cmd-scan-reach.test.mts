@@ -20,7 +20,7 @@ describe('socket scan reach', async () => {
     async cmd => {
       const { code, stderr, stdout } = await spawnSocketCli(binCliPath, cmd)
       expect(stdout).toMatchInlineSnapshot(`
-        "Compute tier 1 reachability
+        "Compute full application reachability
 
           Usage
             $ socket scan reach [options] [CWD=.]
@@ -37,20 +37,25 @@ describe('socket scan reach', async () => {
             --output            Path to write the reachability report to (must end with .json). Defaults to .socket.facts.json in the current working directory.
 
           Reachability Options
-            --exclude-paths     List of glob patterns to exclude from the scan, including SCA/SBOM manifest discovery and (when --reach is enabled) Tier 1 reachability analysis. Patterns are anchored micromatch globs matched relative to the Socket scan root, which is the command working directory (\`--cwd\` if set), not the reachability target: \`tests\` matches only \`<cwd>/tests\`; use \`**/tests\` to match at any depth. Negation patterns (\`!path\`) are not supported. Accepts a comma-separated value or multiple flags.
-            --reach-analysis-memory-limit  The maximum memory in MB to use for the reachability analysis. The default is 8192MB.
-            --reach-analysis-timeout  Set timeout for the reachability analysis. Split analysis runs may cause the total scan time to exceed this timeout significantly.
-            --reach-concurrency  Set the maximum number of concurrent reachability analysis runs. It is recommended to choose a concurrency level that ensures each analysis run has at least the --reach-analysis-memory-limit amount of memory available. NPM reachability analysis does not support concurrent execution, so the concurrency level is ignored for NPM.
-            --reach-continue-on-analysis-errors  Continue reachability analysis when errors occur (timeouts, OOM, parse errors, etc.), falling back to precomputed (Tier 2) results. By default, the CLI halts on analysis errors.
-            --reach-continue-on-install-errors  Continue reachability analysis when package installation fails, falling back to precomputed (Tier 2) results. By default, the CLI halts on installation errors.
+            --dynamic-sbom-inference  For Gradle, sbt, Maven and .NET: generate a Socket facts SBOM (produced directly by each package manager) per independent build root, instead of one synthetic root. The reachability analysis is split per project/module accordingly.
+            --dynamic-sbom-inference-ecosystems  With --dynamic-sbom-inference: generate Socket facts only for these ecosystems, as either a comma separated value or as multiple flags; the others keep their manifest files as they are. Supported: maven (Gradle, Maven, and sbt) and nuget (.NET). Defaults to all of them.
+            --exclude-paths     List of glob patterns to exclude from the scan, including SCA/SBOM manifest discovery and (when --reach is enabled) full application reachability analysis. Patterns are anchored micromatch globs matched relative to the Socket scan root, which is the command working directory (\`--cwd\` if set), not the reachability target: \`tests\` matches only \`<cwd>/tests\`; use \`**/tests\` to match at any depth. Negation patterns (\`!path\`) are not supported. Accepts a comma-separated value or multiple flags. An excluded JVM build module or .NET project is not analysed as a project of its own, but where a project that is not excluded depends on it, its code is analysed as part of that project. A build module or project outside the scan root cannot be excluded.
+            --reach-advisories  List of advisories to run reachability analysis for, as GHSA or CVE IDs, either as a comma separated value or as multiple flags. CVE IDs are converted to GHSA IDs through the GitHub API. Vulnerabilities from other advisories get unknown reachability. Defaults to all advisories.
+            --reach-analysis-memory-limit  The maximum memory for the reachability analysis as a whole number optionally followed by MB or GB (e.g. 512MB, 8GB). The default is 8GB.
+            --reach-analysis-timeout  Set the timeout for the reachability analysis as a whole number optionally followed by s, m or h (e.g. 90s, 10m, 1h). Defaults to 10m. Split analysis runs may cause the total scan time to exceed this timeout significantly.
+            --reach-concurrency  Set the maximum number of concurrent reachability analysis runs. It is recommended to choose a concurrency level that ensures each analysis run has at least the --reach-analysis-memory-limit amount of memory available.
+            --reach-continue-on-analysis-errors  Continue reachability analysis when errors occur (timeouts, OOM, parse errors, etc.), falling back to precomputed reachability results. By default, the CLI halts on analysis errors.
+            --reach-continue-on-install-errors  Continue reachability analysis when package installation fails, falling back to precomputed reachability results. By default, the CLI halts on installation errors.
             --reach-continue-on-missing-lock-files  Continue reachability analysis when a Gradle or SBT project is missing its lock file (or version catalog / pre-generated SBOM). By default, the CLI halts.
             --reach-continue-on-no-source-files  Continue reachability analysis when a workspace contains no source files for its ecosystem. By default, the CLI halts.
             --reach-debug       Enable debug mode for reachability analysis. Provides verbose logging from the reachability CLI.
             --reach-detailed-analysis-log-file  A log file with detailed analysis logs is written to root of each analyzed workspace.
             --reach-disable-analytics  Disable reachability analytics sharing with Socket. Also disables caching-based optimizations.
+            --reach-disable-dependency-downloads  Only analyze dependencies that are already installed (e.g. in the project's .venv, vendor directory or module cache). Missing dependencies count as installation failures.
             --reach-disable-external-tool-checks  Disable external tool checks during reachability analysis.
-            --reach-ecosystems  List of ecosystems to conduct reachability analysis on, as either a comma separated value or as multiple flags. Defaults to all ecosystems.
+            --reach-ecosystems  List of ecosystems to conduct reachability analysis on, as either a comma separated value or as multiple flags. Supported: cargo, composer, gem, golang, maven, npm, nuget, pypi. Defaults to all supported ecosystems.
             --reach-enable-analysis-splitting  Allow the reachability analysis to partition CVEs into buckets that are processed in separate analysis runs. May improve accuracy, but not recommended by default.
+            --reach-retain-facts-file  Keep the \`.socket.facts.json\` reachability report that the analysis writes to the scan directory instead of deleting it after a successful scan. Delete it once inspected: later reachability scans ignore it, but a scan without --reach uploads it as an SBOM carrying stale reachability results.
             --reach-skip-cache  Skip caching-based optimizations. By default, the reachability analysis will use cached configurations from previous runs to speed up the analysis.
             --reach-use-only-pregenerated-sboms  When using this option, the scan is created based only on pre-generated CDX and SPDX files in your project.
             --reach-version     Override the version of @coana-tech/cli used for reachability analysis. Default: <coana-version>.
@@ -67,6 +72,7 @@ describe('socket scan reach', async () => {
             $ socket scan reach
             $ socket scan reach ./proj
             $ socket scan reach ./proj --reach-ecosystems npm,pypi
+            $ socket scan reach ./monorepo --dynamic-sbom-inference
             $ socket scan reach --output custom-report.json
             $ socket scan reach ./proj --output ./reports/analysis.json"
       `)
@@ -286,6 +292,27 @@ describe('socket scan reach', async () => {
       const { code, stderr, stdout } = await spawnSocketCli(binCliPath, cmd)
       const output = stdout + stderr
       expect(output).toContain('Invalid ecosystem: "invalid-ecosystem"')
+      expect(code, 'should exit with non-zero code').not.toBe(0)
+    },
+  )
+
+  cmdit(
+    [
+      'scan',
+      'reach',
+      '--reach-ecosystems',
+      'conda',
+      '--org',
+      'fakeOrg',
+      FLAG_CONFIG,
+      '{"apiToken":"fakeToken"}',
+    ],
+    'should reject a purl type that lacks reachability support',
+    async cmd => {
+      const { code, stderr, stdout } = await spawnSocketCli(binCliPath, cmd)
+      const output = stdout + stderr
+      expect(output).toContain('Invalid ecosystem: "conda"')
+      expect(output).toContain('maven')
       expect(code, 'should exit with non-zero code').not.toBe(0)
     },
   )
@@ -1050,7 +1077,7 @@ describe('socket scan reach', async () => {
         FLAG_CONFIG,
         '{"apiToken":"fake-token"}',
       ],
-      'should show clear error for invalid memory limit',
+      'should forward an unrecognized memory value to Coana without locally rejecting it',
       async cmd => {
         const { code, stderr, stdout } = await spawnSocketCli(binCliPath, cmd)
         const output = stdout + stderr
@@ -1065,13 +1092,13 @@ describe('socket scan reach', async () => {
         'reach',
         FLAG_DRY_RUN,
         '--reach-analysis-memory-limit',
-        '-1',
+        '512kb',
         '--org',
         'fakeOrg',
         FLAG_CONFIG,
         '{"apiToken":"fake-token"}',
       ],
-      'should show clear error for negative memory limit',
+      'should forward an unsupported memory unit to Coana without locally rejecting it',
       async cmd => {
         const { code, stderr, stdout } = await spawnSocketCli(binCliPath, cmd)
         const output = stdout + stderr
@@ -1092,7 +1119,7 @@ describe('socket scan reach', async () => {
         FLAG_CONFIG,
         '{"apiToken":"fake-token"}',
       ],
-      'should show clear error for invalid timeout value',
+      'should forward an unrecognized timeout value to Coana without locally rejecting it',
       async cmd => {
         const { code, stderr, stdout } = await spawnSocketCli(binCliPath, cmd)
         const output = stdout + stderr
@@ -1107,13 +1134,13 @@ describe('socket scan reach', async () => {
         'reach',
         FLAG_DRY_RUN,
         '--reach-analysis-timeout',
-        '0',
+        '10m',
         '--org',
         'fakeOrg',
         FLAG_CONFIG,
         '{"apiToken":"fake-token"}',
       ],
-      'should show clear error for zero timeout',
+      'should accept a timeout value with a unit suffix',
       async cmd => {
         const { code, stderr, stdout } = await spawnSocketCli(binCliPath, cmd)
         const output = stdout + stderr
@@ -1142,7 +1169,7 @@ describe('socket scan reach', async () => {
         expect(output.length).toBeGreaterThan(0)
       },
       // Non-dry-run invocation actually starts Coana, which under v15
-      // performs more upfront work (tier1 scan registration, legacy-mode
+      // performs more upfront work (full application reachability scan registration, legacy-mode
       // resolution) before failing on the bad memory limit. The default
       // 30s cmdit timeout is too tight for that path on slower CI runners.
       { timeout: 60_000 },
@@ -1184,7 +1211,7 @@ describe('socket scan reach', async () => {
       'should prioritize help over other flags',
       async cmd => {
         const { code, stdout } = await spawnSocketCli(binCliPath, cmd)
-        expect(stdout).toContain('Compute tier 1 reachability')
+        expect(stdout).toContain('Compute full application reachability')
         expect(code).toBe(0)
       },
     )

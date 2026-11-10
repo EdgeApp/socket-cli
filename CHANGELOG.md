@@ -4,6 +4,721 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Fixed
+- When `dotnet restore` fails in one .NET project, the projects it may have skipped as up to date are no longer reported as not restored.
+
+## [1.14.1](https://github.com/SocketDev/socket-cli/releases/tag/v1.14.1) - 2026-11-06
+
+### Changed
+- Updated the Coana CLI to v `15.14.2`.
+
+## [1.14.0](https://github.com/SocketDev/socket-cli/releases/tag/v1.14.0) - 2026-11-05
+
+### Added
+- Choose which ecosystems `--dynamic-sbom-inference` covers with `--dynamic-sbom-inference-ecosystems` (`maven` for Gradle, sbt and Maven; `nuget` for .NET) on `socket scan create`, `socket scan reach` and `socket fix`. Ecosystems left out keep their manifest files as they are.
+
+### Changed
+- With `--dynamic-sbom-inference`, reachability analysis and `socket fix` now take the dependencies of every Gradle, sbt, Maven and .NET build they find from Socket facts only, so results no longer depend on which other builds produced facts.
+- `socket manifest auto`, `--auto-manifest` and `--dynamic-sbom-inference` (with its setup) now fail a .NET build that has no usable .NET SDK, as they do a Maven build without Maven, instead of skipping it. With `--dynamic-sbom-inference`, reachability analysis and `socket fix` warn that builds skipped in `socket.json` are left out, and reachability analysis stops with next steps when no build produced Socket facts.
+
+## [1.13.1](https://github.com/SocketDev/socket-cli/releases/tag/v1.13.1) - 2026-11-03
+
+### Fixed
+- Reachability scans of .NET projects now read your projects without running any of their build targets, so builds with compiler-less projects such as `Microsoft.Build.Traversal` aggregators no longer fail.
+
+## [1.13.0](https://github.com/SocketDev/socket-cli/releases/tag/v1.13.0) - 2026-11-03
+
+### Added
+- `socket manifest dotnet` [beta] generates Socket facts files for .NET solutions and projects from your own `dotnet restore`, covering PackageReference (central package management and lock files included) and packages.config projects.
+- `socket manifest auto`, `socket manifest setup` and `--auto-manifest` now detect .NET solutions and projects, and skip them with a warning where no .NET SDK is installed.
+
+### Changed
+- Modules outside the scan root can no longer be excluded with `--exclude-paths`; `**/x` used to match a `../x` module by accident. Single-root runs whose Maven or Gradle options relocate the build root (`-f`, `-p`) now match patterns relative to the current directory, as documented.
+- Updated the Coana CLI to v `15.14.1`.
+
+### Fixed
+- `--exclude-paths` patterns are now matched relative to the scan root in every build root. They now also exclude modules a build reaches outside its own directory (Maven `../` modules, relocated Gradle projects) and modules matched by wildcards that span a build-root boundary, such as `*/core`.
+- `--exclude-paths` patterns written with Windows `\` separators now exclude JVM build modules in single-root runs too.
+- Maven SBOMs keep the dependencies a module reaches through a sibling module's test-jar.
+- sbt SBOMs now generate for builds with relocated Maven dependencies, such as `mysql:mysql-connector-java`.
+
+## [1.12.2](https://github.com/SocketDev/socket-cli/releases/tag/v1.12.2) - 2026-10-30
+
+### Changed
+- Updated the Coana CLI to v `15.14.0`.
+
+## [1.12.1](https://github.com/SocketDev/socket-cli/releases/tag/v1.12.1) - 2026-10-29
+
+### Changed
+- Updated the Coana CLI to v `15.13.3`.
+
+## [1.12.0](https://github.com/SocketDev/socket-cli/releases/tag/v1.12.0) - 2026-10-29
+
+### Added
+- `--reach-disable-dependency-downloads` limits reachability analysis to already-installed dependencies.
+
+## [1.11.2](https://github.com/SocketDev/socket-cli/releases/tag/v1.11.2) - 2026-10-29
+
+### Changed
+- Updated the Coana CLI to v `15.13.2`.
+- `socket scan reach` now shows up in `socket scan --help`.
+
+### Fixed
+- Reachability analysis of Gradle and sbt builds now sees the code of Kotlin Multiplatform and Android modules, and sbt sources placed directly in a project's directory.
+
+## [1.11.1](https://github.com/SocketDev/socket-cli/releases/tag/v1.11.1) - 2026-10-27
+
+### Added
+- Set `SOCKET_BAZEL_OUTPUT_ROOT` to choose a short parent directory for temporary Bazel output, including on Windows.
+
+### Changed
+- `--dynamic-sbom-inference` now builds every Maven POM a scan uploads, not only `pom.xml`: `<artifactId>-<version>.pom` and `.pom.xml` files, a bare `pom`, and names in any case, each as a build of its own. Like the upload, it skips POMs matched by `.gitignore` or by `projectIgnorePaths` in `socket.yml`.
+
+### Fixed
+- Bazel Maven extraction handles native Windows executables, batch launchers, and JavaScript entry points while preserving arguments and the selected executable path.
+- Bazel prerequisite checks use the extraction environment and verify Python 3. Windows requires a working `python.exe` without creating a Python symlink.
+- Quoted Bazel flags preserve spaces and Windows backslashes. Quotes open at the start of a value or after `=`, so apostrophes inside a value stay literal. Unclosed quotes produce an error.
+- Bazel cleanup uses the extraction workspace, environment, and startup options, retries temporary file locks, and only stops Bazel servers the scan started.
+- Bazel timeouts and cancellation stop every process a Bazel launcher started. Cleanup still runs after Ctrl-C and keeps temporary output until the scan's own Bazel server has exited.
+- A relative `--bazel` path resolves against the current directory. A relative `bazel` path in `socket.json` resolves against the scanned directory.
+
+## [1.11.0](https://github.com/SocketDev/socket-cli/releases/tag/v1.11.0) - 2026-10-26
+
+### Added
+- `socket scan create --reach` and `socket scan reach` take `--reach-advisories` to focus reachability analysis on the GHSA or CVE advisories you care about. Every other advisory is left with unknown reachability.
+
+### Changed
+- Updated the Coana CLI to v `15.13.0`.
+
+## [1.10.1](https://github.com/SocketDev/socket-cli/releases/tag/v1.10.1) - 2026-10-23
+
+### Changed
+- Updated the Coana CLI to v `15.12.12`.
+- JVM manifest generation now fails on dependencies the build tool only warns about or skips, instead of passing them into the scan without code: missing or invalid Maven POMs, missing `system` jars, jars coursier or Ivy could not fetch, failed Gradle project dependencies, artifacts failing Gradle dependency verification, and Gradle variants ambiguous in every configuration.
+- To proceed past them, set `ignoreUnresolved`, and for reachability scans also pass `--reach-continue-on-install-errors`.
+- An artifact with no checksum in Gradle's verification metadata no longer fails the run; it is left out of reachability analysis.
+
+### Fixed
+- With `--dynamic-sbom-inference`, an sbt build that fails before writing its results is reported as failed instead of reusing another build's results.
+- `socket scan create --reach` keeps the private libraries and build modules of Socket facts files in the stored SBOM, with their dependencies under them.
+- JVM dependencies whose jars cannot be fetched, or are gone from disk, no longer reach reachability analysis looking resolved without code.
+- One unresolvable Maven dependency no longer strips the jar paths from every other dependency of its build, which made reachability analysis call their vulnerabilities unreachable. Jars that cannot be fetched are reported with their real cause, Maven 4 included.
+- Maven `system`-scope jars reach reachability analysis, and a failing Maven dependency no longer fails scopes that `excludeConfigs` leaves out, or the build when it lost a version conflict.
+- Reachability scans that hit unresolved JVM dependencies now point out that ignoring them also needs `--reach-continue-on-install-errors`.
+- JVM failures name the version that actually failed, and sbt POM-only, war and aar modules keep their real shape.
+- A module excluded with `--exclude-paths` is still analysed as part of the projects that depend on it.
+
+## [1.10.0](https://github.com/SocketDev/socket-cli/releases/tag/v1.10.0) - 2026-10-22
+
+### Added
+- `socket manifest dynamic-sbom-inference --ignore-unresolved` keeps going past unresolved JVM dependencies in every discovered build.
+
+### Fixed
+- `--dynamic-sbom-inference` honors each build's `verbose` setting in `socket.json`.
+- JVM resolution failures name the dependency that failed, the subproject and scope that needed it, and suggest only options the command you ran accepts, pointing at the failing build's own `socket.json`.
+- Unresolved JVM dependencies are reported and left out of the Socket facts for Maven, Gradle and sbt alike, as far as each build tool identifies them; a Maven dependency in an excluded scope no longer blocks the run.
+- An sbt project with an unresolved dependency keeps the rest of its dependencies instead of silently losing all of them.
+- `socket scan create` and `socket scan reach` warn about `--ignore-unresolved`, `--exclude-configs`, `--include-configs` and `--verbose`, which they read from `socket.json` instead.
+- When a build tool cannot be started, the error says why, for example a missing `mvn`.
+
+## [1.9.1](https://github.com/SocketDev/socket-cli/releases/tag/v1.9.1) - 2026-10-21
+
+### Changed
+- Updated the Coana CLI to v `15.12.11`.
+
+## [1.9.0](https://github.com/SocketDev/socket-cli/releases/tag/v1.9.0) - 2026-10-20
+
+### Changed
+- The Coana CLI is now downloaded from Socket's servers instead of npm, and is now cached in `$XDG_CACHE_HOME/socket/coana` (`~/.cache/socket/coana` by default).
+- Updated the Coana CLI to v `15.12.10`.
+
+### Removed
+- The `SOCKET_CLI_COANA_LAUNCHER` environment variable no longer has an effect.
+
+## [1.8.4](https://github.com/SocketDev/socket-cli/releases/tag/v1.8.4) - 2026-10-16
+
+### Changed
+- `socket fix` now exits with code 5 when it computed fixes it could not apply, matching the Coana CLI. Automation can tell this apart from a failed run, which still exits with 1. The `--output-file` JSON lists the unapplied fixes under `notApplied`.
+- Updated the Coana CLI to v `15.12.9`.
+
+## [1.8.3](https://github.com/SocketDev/socket-cli/releases/tag/v1.8.3) - 2026-10-15
+
+### Changed
+- Updated the Coana CLI to v `15.12.8`.
+
+## [1.8.2](https://github.com/SocketDev/socket-cli/releases/tag/v1.8.2) - 2026-10-13
+
+### Fixed
+- Reachability scans in pnpm and yarn projects no longer print a 403 from the Socket API when run with a repository-scoped token. The safety check that runs before Coana launches now uses Socket's public token and only looks up the Coana package itself.
+- `--dynamic-sbom-inference` no longer skips an independent Maven, Gradle or sbt build that shares a directory with a module of another build: only build files another build actually uses count as covered.
+
+## [1.8.1](https://github.com/SocketDev/socket-cli/releases/tag/v1.8.1) - 2026-10-12
+
+### Changed
+- Updated the Coana CLI to v `15.12.7`.
+
+## [1.8.0](https://github.com/SocketDev/socket-cli/releases/tag/v1.8.0) - 2026-10-12
+
+### Changed
+- Socket facts for Maven, Gradle and sbt builds now record each subproject's own dependency tree, so a package is attributed only to the subprojects that actually pull it in.
+- `socket fix` now accepts existing Socket facts files instead of asking you to delete them first.
+- Updated the Coana CLI to v `15.12.5`.
+
+### Fixed
+- Socket facts for sbt builds now match sbt's own classpaths: dependencies pulled in by a version-conflict winner are no longer dropped, and sibling subprojects appear only in the configurations that actually depend on them.
+
+## [1.7.0](https://github.com/SocketDev/socket-cli/releases/tag/v1.7.0) - 2026-10-09
+
+### Changed
+- Socket facts for Maven, Gradle and sbt builds are now written per build — `pom.xml.socket.facts.json` (named after the POM Maven runs on, so `-f other-pom.xml` gets its own), `gradle.socket.facts.json` and `sbt.socket.facts.json` — so builds sharing a directory no longer overwrite each other. Delete any `.socket.facts.json` an earlier run left behind.
+- Reachability scans no longer feed a leftover `.socket.facts.json` report from an earlier run back into the analysis.
+- Updated the Coana CLI to v `15.12.4`.
+
+## [1.6.2](https://github.com/SocketDev/socket-cli/releases/tag/v1.6.2) - 2026-10-09
+
+### Changed
+- Updated the Coana CLI to v `15.12.3`.
+
+### Fixed
+- Socket facts no longer merge build projects into one: Maven modules sharing a directory and Gradle or sbt projects sharing a coordinate each keep their own dependencies and build files.
+- Socket facts for a Maven or Gradle build pointed elsewhere with `-f` or `-p` are now written into that build's own directory, where their paths resolve.
+
+## [1.6.1](https://github.com/SocketDev/socket-cli/releases/tag/v1.6.1) - 2026-10-08
+
+### Changed
+- Updated the Coana CLI to v `15.12.2`.
+
+## [1.6.0](https://github.com/SocketDev/socket-cli/releases/tag/v1.6.0) - 2026-10-07
+
+### Added
+- **`manifest`** — attribute direct JVM dependencies to subproject build files (#1581)
+
+## [1.5.0](https://github.com/SocketDev/socket-cli/releases/tag/v1.5.0) - 2026-10-06
+
+### Added
+- `socket fix --allow-overrides` fixes a vulnerability that a parent package's version range blocks by writing an override or resolution that forces the fixed version under that parent, in npm, pnpm, Yarn Berry and Rush projects.
+- Socket facts for multi-module Maven, Gradle and sbt builds now attribute each direct dependency to the subproject build files that pull it in, so the dashboard shows which module brought it in.
+
+### Changed
+- Updated the Coana CLI to v `15.12.1`.
+
+## [1.4.2](https://github.com/SocketDev/socket-cli/releases/tag/v1.4.2) - 2026-10-05
+
+### Changed
+- Updated the Coana CLI to v `15.11.6`.
+
+## [1.4.1](https://github.com/SocketDev/socket-cli/releases/tag/v1.4.1) - 2026-09-30
+
+### Changed
+- Updated the Coana CLI to v `15.11.5`.
+
+### Fixed
+- `socket fix` pull requests now include every file a fix changes, such as `package.json` override bumps, and work when run from a subdirectory of the repository.
+
+## [1.4.0](https://github.com/SocketDev/socket-cli/releases/tag/v1.4.0) - 2026-09-29
+
+### Changed
+- Updated the Coana CLI to v `15.11.4`.
+
+## [1.3.0](https://github.com/SocketDev/socket-cli/releases/tag/v1.3.0) - 2026-09-29
+
+### Added
+
+- `socket scan create --uv-members <dir...>` scans selected uv workspace members with the versions and dependency relationships pinned in their shared `uv.lock`, leaving unrelated members out of the scan. Dependencies used only by dependency groups are marked as development dependencies. Requires uv with CycloneDX export support.
+
+## [1.2.1](https://github.com/SocketDev/socket-cli/releases/tag/v1.2.1) - 2026-09-28
+
+### Changed
+- Updated the Coana CLI to v `15.11.3`.
+
+## [1.2.0](https://github.com/SocketDev/socket-cli/releases/tag/v1.2.0) - 2026-09-27
+
+### Added
+- `socket fix --dynamic-sbom-inference` generates Socket facts for each Gradle, sbt and Maven build and fixes a vulnerable dependency only in the projects/modules that resolve it. The generated files are removed afterwards.
+
+### Changed
+- Updated the Coana CLI to v `15.11.0`.
+
+### Fixed
+- Fixes opened as pull requests now include edits to build files that are not uploaded manifests, such as `gradle.properties` or sbt `project/*.scala` files, and the files a fix creates.
+
+## [1.1.180](https://github.com/SocketDev/socket-cli/releases/tag/v1.1.180) - 2026-09-25
+
+### Changed
+- A failed Conda manifest step now stops `--auto-manifest` instead of uploading a scan that under-reports your `pip:` dependencies, matching how Gradle, Maven and sbt already behave.
+
+### Fixed
+- `--auto-manifest` now reads whichever Conda environment file your project uses, `environment.yml` or `environment.yaml`. Repos on the `.yaml` spelling no longer need a `socket.json` workaround.
+- The Conda `requirements.txt` now lands in the directory you targeted, so scans pick it up even when you run the CLI from somewhere else.
+
+## [1.1.179](https://github.com/SocketDev/socket-cli/releases/tag/v1.1.179) - 2026-09-24
+
+### Changed
+- Updated the Coana CLI to v `15.10.55`.
+- Generated Maven, Gradle and sbt `.socket.facts.json` files are now substantially smaller, making uploads for large JVM projects faster and more reliable.
+
+### Fixed
+- Running `socket manifest maven` or `socket manifest scala` on a directory without a build now fails with a clear message, instead of crashing (Maven) or silently producing a bogus Socket facts file (sbt).
+
+## [1.1.178](https://github.com/SocketDev/socket-cli/releases/tag/v1.1.178) - 2026-09-23
+
+### Changed
+- Updated the Coana CLI to v `15.10.49`.
+
+### Fixed
+- Fixed Maven manifest generation so a dependency is no longer emitted as an orphaned component when Maven's conflict resolution keeps it under a test or provided parent while its effective scope is compile. These components previously produced spurious "orphaned component not reachable from any direct dependency" alerts.
+
+## [1.1.176](https://github.com/SocketDev/socket-cli/releases/tag/v1.1.176) - 2026-09-17
+
+### Changed
+- Updated the Coana CLI to v `15.10.45`.
+
+## [1.1.175](https://github.com/SocketDev/socket-cli/releases/tag/v1.1.175) - 2026-09-17
+
+### Fixed
+- **`api`** — honor proxy config for direct API calls (#1543)
+
+## [1.1.174](https://github.com/SocketDev/socket-cli/releases/tag/v1.1.174) - 2026-09-17
+
+### Changed
+- Updated the Coana CLI to v `15.10.44`.
+
+## [1.1.173](https://github.com/SocketDev/socket-cli/releases/tag/v1.1.173) - 2026-09-16
+
+### Changed
+- Updated the Coana CLI to v `15.10.43`.
+
+## [1.1.172](https://github.com/SocketDev/socket-cli/releases/tag/v1.1.172) - 2026-09-16
+
+### Added
+- Added the `--reach-fallback-to-regular-scan` flag to `socket scan create`, keeping the scan moving with regular SCA results when full application reachability analysis fails. The JSON and Markdown output carry a `reachabilityFallback` marker so automation can tell a downgraded scan from a full one.
+
+### Changed
+- Updated the Coana CLI to v `15.10.42`.
+
+## [1.1.171](https://github.com/SocketDev/socket-cli/releases/tag/v1.1.171) - 2026-09-11
+
+### Changed
+- Updated the Coana CLI to v `15.10.40`.
+
+## [1.1.170](https://github.com/SocketDev/socket-cli/releases/tag/v1.1.170) - 2026-09-08
+
+### Changed
+- Updated the Coana CLI to v `15.10.39`.
+
+## [1.1.169](https://github.com/SocketDev/socket-cli/releases/tag/v1.1.169) - 2026-09-07
+
+## [1.1.168](https://github.com/SocketDev/socket-cli/releases/tag/v1.1.168) - 2026-09-07
+
+### Changed
+- Updated the Coana CLI to v `15.10.38`.
+
+## [1.1.167](https://github.com/SocketDev/socket-cli/releases/tag/v1.1.167) - 2026-09-03
+
+### Changed
+- Updated the Coana CLI to v `15.10.36`.
+
+## [1.1.166](https://github.com/SocketDev/socket-cli/releases/tag/v1.1.166) - 2026-09-03
+
+### Changed
+- Updated the Coana CLI to v `15.10.33`.
+
+### Fixed
+- `socket scan create --dynamic-sbom-inference` works without `--reach` again, so a single command produces a per-build-root Socket facts SBOM for Gradle, sbt, and Maven projects. It is a standalone flag now, no longer a reachability modifier.
+- `--dynamic-sbom-inference` no longer generates Conda or Bazel manifests as a side effect. It touches Gradle, sbt, and Maven only; pass `--auto-manifest` alongside it if you want the other ecosystems too.
+
+## [1.1.165](https://github.com/SocketDev/socket-cli/releases/tag/v1.1.165) - 2026-09-02
+
+### Changed
+- Updated the Coana CLI to v `15.10.32`.
+
+## [1.1.164](https://github.com/SocketDev/socket-cli/releases/tag/v1.1.164) - 2026-09-01
+
+### Changed
+- Updated the Coana CLI to v `15.10.28`.
+
+## [1.1.163](https://github.com/SocketDev/socket-cli/releases/tag/v1.1.163) - 2026-08-31
+
+### Changed
+- Updated the Coana CLI to v `15.10.27`.
+
+## [1.1.162](https://github.com/SocketDev/socket-cli/releases/tag/v1.1.162) - 2026-08-28
+
+### Changed
+- Updated the Coana CLI to v `15.10.26`.
+
+### Fixed
+- Maven reachability scans now resolve dependencies through Maven itself, so they see the same artifacts a Maven build does — including one served only by a repository that a single module declares.
+
+## [1.1.160](https://github.com/SocketDev/socket-cli/releases/tag/v1.1.160) - 2026-08-26
+
+### Changed
+- Updated the Coana CLI to v `15.10.24`.
+
+## [1.1.158](https://github.com/SocketDev/socket-cli/releases/tag/v1.1.158) - 2026-08-17
+
+### Changed
+- Updated the Coana CLI to v `15.10.15`.
+
+### Fixed
+- `socket scan create` now rejects every `--reach-*` modifier when `--reach` is not enabled. Previously flags such as `--reach-debug` were silently ignored, making a plain SBOM scan look like a reachability scan.
+
+## [1.1.157](https://github.com/SocketDev/socket-cli/releases/tag/v1.1.157) - 2026-08-12
+
+### Changed
+- Updated the Coana CLI to v `15.10.13`.
+
+### Fixed
+- `socket scan reach` again names the workspace a reachability error came from, instead of reporting every error against the repository root.
+
+## [1.1.156](https://github.com/SocketDev/socket-cli/releases/tag/v1.1.156) - 2026-08-10
+
+### Changed
+- Updated the Coana CLI to v `15.10.10`.
+
+## [1.1.155](https://github.com/SocketDev/socket-cli/releases/tag/v1.1.155) - 2026-08-07
+
+### Added
+- `socket scan create --reach --dynamic-sbom-inference` splits full application reachability analysis per project/module for Gradle, sbt, and Maven monorepos, using a Socket facts SBOM generated directly by each package manager for every build root, instead of one synthetic root.
+- `socket manifest setup --dynamic-sbom-inference` extends the interactive `socket.json` configurator to walk every independent Gradle, sbt, and Maven build root in your project.
+- `socket manifest dynamic-sbom-inference`: generate a Socket facts SBOM for every independent Gradle, sbt, and Maven build root directly, without creating a scan.
+
+### Changed
+- Updated the Coana CLI to v `15.10.8`.
+
+### Fixed
+- Declared `form-data` as a dependency, so a fresh install no longer throws `Cannot find module 'form-data'` on its first upload.
+
+## [1.1.154](https://github.com/SocketDev/socket-cli/releases/tag/v1.1.154) - 2026-08-06
+
+### Changed
+- Updated the Coana CLI to v `15.10.4`.
+
+## [1.1.153](https://github.com/SocketDev/socket-cli/releases/tag/v1.1.153) - 2026-08-04
+
+### Changed
+- Updated the Coana CLI to v `15.10.2`.
+
+## [1.1.152](https://github.com/SocketDev/socket-cli/releases/tag/v1.1.152) - 2026-08-03
+
+### Changed
+- Updated the Coana CLI to v `15.10.0`.
+
+## [1.1.151](https://github.com/SocketDev/socket-cli/releases/tag/v1.1.151) - 2026-07-31
+
+### Changed
+- Updated the Coana CLI to v `15.9.9`.
+- `socket scan view` now reads completed scans from Socket's cached immutable results, retrying briefly while a fresh scan finalizes; `--stream` keeps streaming live results.
+- `socket fix` vulnerability discovery now reads Coana's structured `--output-file` JSON result instead of parsing stdout, and warns when the Socket backend resolved 0 artifacts so an incomplete server-side resolve is surfaced instead of silently reporting "Finished!".
+
+### Fixed
+- `socket fix` no longer reports success when the Coana vulnerability-discovery step fails — Coana errors and unreadable discovery output now exit non-zero with the underlying reason instead of printing "Finished!" with nothing fixed.
+- Fixed `--auto-manifest --reach` reachability scans on sbt/Scala projects sometimes failing to resolve the Scala standard library.
+
+## [1.1.147](https://github.com/SocketDev/socket-cli/releases/tag/v1.1.147) - 2026-07-27
+
+### Changed
+- Updated the Coana CLI to v `15.9.4`.
+
+## [1.1.146](https://github.com/SocketDev/socket-cli/releases/tag/v1.1.146) - 2026-07-24
+
+### Changed
+- Updated the Coana CLI to v `15.9.1`.
+
+## [1.1.145](https://github.com/SocketDev/socket-cli/releases/tag/v1.1.145) - 2026-07-23
+
+### Changed
+- Updated the Coana CLI to v `15.9.0`.
+
+## [1.1.144](https://github.com/SocketDev/socket-cli/releases/tag/v1.1.144) - 2026-07-23
+
+### Fixed
+- `--reach-ecosystems` now rejects ecosystems the reachability engine cannot analyze, failing fast at the CLI with a clear message listing the supported ecosystems instead of erroring partway through a scan.
+
+## [1.1.143](https://github.com/SocketDev/socket-cli/releases/tag/v1.1.143) - 2026-07-10
+
+### Changed
+- Updated the Coana CLI to v `15.8.8`.
+
+## [1.1.142](https://github.com/SocketDev/socket-cli/releases/tag/v1.1.142) - 2026-07-10
+
+### Added
+- The `socket manifest` commands (`auto`, `gradle`, `kotlin`, `maven`, `scala`) now accept `--exclude-paths`, keeping excluded subprojects and their dependencies out of generated manifests.
+
+### Fixed
+- `--exclude-paths` is now fully honored across JVM, .NET, and Rust reachability analysis: excluded directories no longer contribute dependencies, code, or framework resources to scan results. Includes an update of the Coana CLI to v `15.8.7`.
+- Invalid `--exclude-paths` glob patterns are rejected with a clear error instead of failing mid-scan.
+
+## [1.1.141](https://github.com/SocketDev/socket-cli/releases/tag/v1.1.141) - 2026-07-10
+
+### Changed
+- Updated the Coana CLI to v `15.8.6`.
+
+## [1.1.140](https://github.com/SocketDev/socket-cli/releases/tag/v1.1.140) - 2026-07-08
+
+### Changed
+- Updated the Coana CLI to v `15.8.5`.
+
+## [1.1.139](https://github.com/SocketDev/socket-cli/releases/tag/v1.1.139) - 2026-07-07
+
+### Changed
+- Updated the Coana CLI to v `15.8.4`.
+
+## [1.1.138](https://github.com/SocketDev/socket-cli/releases/tag/v1.1.138) - 2026-07-07
+
+### Changed
+- Updated the Coana CLI to v `15.8.2`.
+
+## [1.1.137](https://github.com/SocketDev/socket-cli/releases/tag/v1.1.137) - 2026-07-03
+
+### Changed
+- Updated the Coana CLI to v `15.8.1`.
+
+## [1.1.136](https://github.com/SocketDev/socket-cli/releases/tag/v1.1.136) - 2026-07-02
+
+### Changed
+- `socket manifest gradle --facts` now reports Gradle configurations it can't resolve instead of silently skipping them, failing the run unless you pass `--ignore-unresolved` so an incomplete scan can't slip by. Benign variant-selection ambiguity stays a one-line notice.
+- Config filters (`--include-configs` / `--exclude-configs`) for `socket manifest gradle`, `kotlin`, `scala`, and `maven` are now case-sensitive, as documented, and support `[...]` character classes — e.g. `*[Tt]est*` matches both `testCompileClasspath` and `androidTestCompileClasspath`.
+
+### Fixed
+- `socket manifest auto` and `socket scan create --auto-manifest` now detect a Gradle project by its build files (`build.gradle`/`.kts` or `settings.gradle`/`.kts`) instead of requiring a `gradlew` wrapper, so wrapper-less projects — including settings-only multi-module roots — are no longer skipped.
+
+## [1.1.135](https://github.com/SocketDev/socket-cli/releases/tag/v1.1.135) - 2026-07-01
+
+### Changed
+- Updated the Coana CLI to v `15.6.7`.
+
+## [1.1.134](https://github.com/SocketDev/socket-cli/releases/tag/v1.1.134) - 2026-07-01
+
+### Fixed
+- `--reach-use-only-pregenerated-sboms` now recognizes Socket facts files (`.socket.facts.json`) as pre-generated SBOMs, alongside CycloneDX and SPDX — matching what the reachability analyzer accepts. Previously a project whose only pre-generated SBOM was a `.socket.facts.json` was ignored by this flag.
+
+## [1.1.133](https://github.com/SocketDev/socket-cli/releases/tag/v1.1.133) - 2026-07-01
+
+### Changed
+- Quieter `socket manifest gradle`, `sbt`, and `maven`: the build tool's output is now hidden behind a progress spinner and shown only if the build fails. Pass `--verbose` to stream it live.
+- `--auto-manifest` now fails fast: if a Gradle, sbt, or Maven build fails, the run stops instead of continuing with an incomplete SBOM.
+
+## [1.1.132](https://github.com/SocketDev/socket-cli/releases/tag/v1.1.132) - 2026-06-30
+
+### Changed
+- More reliable reachability for Gradle, sbt, and Maven projects with dynamic versions (git versions, CI build numbers, timestamps): the build is resolved once and its artifact paths reused, avoiding spurious "failed to install" errors.
+- `socket manifest` and `--auto-manifest` now prefer your project's build-tool wrapper (`./gradlew`, `./mvnw`) when present, falling back to `gradle`/`mvn` on PATH.
+- Updated the Coana CLI to v `15.6.6`.
+
+## [1.1.131](https://github.com/SocketDev/socket-cli/releases/tag/v1.1.131) - 2026-06-29
+
+### Changed
+- Updated the Coana CLI to v `15.6.2`.
+
+## [1.1.130](https://github.com/SocketDev/socket-cli/releases/tag/v1.1.130) - 2026-06-29
+
+### Fixed
+- Reachability analysis no longer fails to start in pnpm workspaces that define a `.pnpmfile.cjs`. Socket now launches its bundled analysis tools without running the project's pnpm hooks, so a broken or environment-specific hook (for example, one that loads a file managed by Git LFS) can no longer stop a scan before it begins.
+
+## [1.1.129](https://github.com/SocketDev/socket-cli/releases/tag/v1.1.129) - 2026-06-26
+
+### Changed
+- Updated the Coana CLI to v `15.6.1`.
+
+## [1.1.128](https://github.com/SocketDev/socket-cli/releases/tag/v1.1.128) - 2026-06-25
+
+### Changed
+- Updated the Coana CLI to v `15.5.10`.
+
+### Fixed
+- Scans now skip Python virtual environments when collecting manifest files. Folders named `.venv`, and any folder containing a `pyvenv.cfg` marker (covering `venv`, `env`, and custom-named environments), are excluded — so `socket scan`, reachability, and `socket fix` stay focused on your project's own manifests instead of the thousands installed inside a virtualenv.
+
+## [1.1.127](https://github.com/SocketDev/socket-cli/releases/tag/v1.1.127) - 2026-06-24
+
+### Changed
+- Updated the Coana CLI to v `15.5.9`.
+
+## [1.1.126](https://github.com/SocketDev/socket-cli/releases/tag/v1.1.126) - 2026-06-22
+
+### Changed
+- Reachability analysis types are now referred to by descriptive names in command help, output, and docs: Full application reachability (formerly Tier 1), Precomputed reachability (formerly Tier 2), and Dependency reachability (formerly Tier 3).
+- Updated the Coana CLI to v `15.5.7`.
+
+## [1.1.125](https://github.com/SocketDev/socket-cli/releases/tag/v1.1.125) - 2026-06-22
+
+### Added
+- New `socket manifest maven` command generates a Socket facts file (`.socket.facts.json`) directly from a Maven `pom.xml` project. Like the Gradle and sbt generators, it auto-detects your project, plugs into `socket manifest auto` and the `socket manifest setup` configurator, and accepts `--maven-opts` to pass options through to Maven (e.g. `--maven-opts="-P release -s settings.xml"`), plus `--bin` to point at a wrapper such as `./mvnw`.
+
+### Changed
+- Updated the Coana CLI to v `15.5.5`.
+
+## [1.1.124](https://github.com/SocketDev/socket-cli/releases/tag/v1.1.124) - 2026-06-19
+
+- `socket scan create --reach` accepts a new `--reach-retain-facts-file` flag. By default the CLI deletes the `.socket.facts.json` reachability report from the scan directory after a successful scan; pass this flag to keep it (e.g. for inspection or debugging). **Important:** you must delete the retained `.socket.facts.json` before running a fresh full application reachability scan — a stale file left in place is picked up as a pre-generated input and silently overrides fresh analysis, so the new scan results will not be reliable.
+
+### Changed
+- Updated the Coana CLI to v `15.5.4`.
+
+## [1.1.123](https://github.com/SocketDev/socket-cli/releases/tag/v1.1.123) - 2026-06-18
+
+### Added
+- `socket scan create --reach` and `socket scan reach` now accept unit suffixes on `--reach-analysis-timeout` (`s`, `m`, `h` — e.g. `90s`, `10m`, `1h`) and `--reach-analysis-memory-limit` (`MB`, `GB` — e.g. `512MB`, `8GB`). Plain numbers keep working as before.
+
+### Changed
+- Updated the Coana CLI to v `15.5.0`.
+
+## [1.1.122](https://github.com/SocketDev/socket-cli/releases/tag/v1.1.122) - 2026-06-17
+
+### Changed
+- Updated the Coana CLI to v `15.4.6`.
+
+## [1.1.121](https://github.com/SocketDev/socket-cli/releases/tag/v1.1.121) - 2026-06-17
+
+### Fixed
+- `socket config set` now persists correctly when a Socket API token is supplied via an environment variable. Previously, setting `SOCKET_CLI_API_TOKEN` / `SOCKET_SECURITY_API_TOKEN` put the entire config into read-only mode, so `socket config set <key> <value>` silently failed to save (and a later `socket config get` showed nothing) while still printing `OK`. A token from the environment now overrides authentication only: unrelated keys such as `defaultOrg` are written to disk as expected, and the env-supplied token itself is still never persisted.
+- `socket config set` no longer reports a misleading `OK` when the value genuinely cannot be saved. When the config is fully overridden (and therefore ephemeral) via `--config`, `SOCKET_CLI_CONFIG`, or `SOCKET_CLI_NO_API_TOKEN`, the command now fails with a clear error explaining that the value was not saved, instead of pretending it succeeded.
+
+## [1.1.120](https://github.com/SocketDev/socket-cli/releases/tag/v1.1.120) - 2026-06-12
+
+### Changed
+- `socket scan create --reach` now applies your project's build-tool settings from `socket.json` (configured via `socket manifest setup`) — custom build-tool binary, include/exclude configs, and Gradle/sbt options — when resolving dependencies for Gradle and sbt reachability analysis, instead of always invoking the build tool with defaults.
+- `socket scan create --auto-manifest --reach` now fails with an error when a build tool fails during manifest generation, rather than tolerating it. Plain `--reach` (without `--auto-manifest`) keeps generating manifests on a best-effort basis.
+- Updated the Coana CLI to v `15.4.5`.
+
+## [1.1.119](https://github.com/SocketDev/socket-cli/releases/tag/v1.1.119) - 2026-06-11
+
+### Changed
+- Updated the Coana CLI to v `15.3.26`.
+
+## [1.1.118](https://github.com/SocketDev/socket-cli/releases/tag/v1.1.118) - 2026-06-08
+
+### Changed
+- Updated the Coana CLI to v `15.3.24`.
+
+## [1.1.117](https://github.com/SocketDev/socket-cli/releases/tag/v1.1.117) - 2026-06-08
+
+### Changed
+- The published package no longer bundles the unused Terminus bitmap font (pulled in transitively by the vendored `blessed` dependency), so its declared license is now `MIT` instead of `MIT AND OFL-1.1`.
+
+## [1.1.116](https://github.com/SocketDev/socket-cli/releases/tag/v1.1.116) - 2026-06-06
+
+### Changed
+- Updated the Coana CLI to v `15.3.22`.
+
+## [1.1.115](https://github.com/SocketDev/socket-cli/releases/tag/v1.1.115) - 2026-06-04
+
+### Fixed
+- `socket manifest gradle`, `kotlin`, and `scala` (including sbt-based projects) now stream the underlying build-tool and Coana output and surface the real failure reason. Previously a generation failure could collapse to an unhelpful `Coana command failed (exit code 1): command failed` with no detail, hiding actionable hints such as unresolved dependencies (re-run with `--ignore-unresolved` / `--exclude-configs`, or `--pom` for the legacy `pom.xml` output).
+
+## [1.1.114](https://github.com/SocketDev/socket-cli/releases/tag/v1.1.114) - 2026-06-04
+
+### Changed
+- `socket manifest gradle`, `kotlin`, and `scala` now generate a Socket facts file (`.socket.facts.json`) by default; pass `--pom` to generate `pom.xml` manifests instead.
+- Replaced `--configs` with `--include-configs` and `--exclude-configs` on `socket manifest gradle/kotlin/scala` for finer control over which build configurations are resolved.
+- Updated the Coana CLI to v `15.3.21`.
+
+## [1.1.113](https://github.com/SocketDev/socket-cli/releases/tag/v1.1.113) - 2026-06-03
+
+### Added
+- **`socket manifest bazel [beta]`** — Generate Bazel JVM SBOM manifests by running `bazel query` against discovered Maven repos in a Bazel workspace. Closes the inline-Maven-declaration gap that lockfile-only parsing misses for repos like envoy, ray, tensorflow, tink-java, and or-tools. Auto-detects Bzlmod and legacy `WORKSPACE`.
+- **`socket scan create --auto-manifest`** now covers Bazel workspaces in addition to Gradle/Scala/Kotlin/Conda. Repos with `MODULE.bazel`, `WORKSPACE`, or `WORKSPACE.bazel` are detected automatically and their Maven dependencies extracted as part of the standard scan-create flow.
+- **Bazel PyPI extraction** — `socket manifest bazel --ecosystem pypi` now generates `requirements.txt` for Python Bazel workspaces. Discovers custom `rules_python` pip hub names with Bazel command output first, queries `py_library` / `py_binary` / `py_test` dependencies, resolves canonical pinned versions from `requirements_lock.txt`, and emits PEP 503-normalized `name==version` lines. Supports both Bzlmod (`pip.parse`) and legacy `WORKSPACE` (`pip_parse` / `pip_install`) configurations. PyPI remains explicit opt-in for `socket scan create --auto-manifest` until real-world no-lockfile recovery is validated.
+
+### Changed
+- **Bazel diagnostics** — `socket manifest bazel --verbose` now emits bounded subprocess traces with argv, cwd, duration, exit status, output sizes, and failure stderr tails to make customer log-only triage safer and faster.
+- Updated the Coana CLI to v `15.3.20`.
+
+## [1.1.112](https://github.com/SocketDev/socket-cli/releases/tag/v1.1.112) - 2026-05-29
+
+### Fixed
+- `socket fix` and `socket scan create` no longer abort with `EACCES: permission denied, scandir` when the project contains a directory the running user cannot read (for example a postgres `pgdata` data directory owned by another uid, or a Docker volume mount). Manifest discovery walks a project for `.gitignore` files before applying any path exclusions; that walk now honors `--exclude-paths` and `socket.yml` `projectIgnorePaths`, and skips unreadable directories rather than crashing. This makes `--exclude-paths` effective for unreadable directories — previously the crash happened before the exclusion was ever applied.
+
+## [1.1.111](https://github.com/SocketDev/socket-cli/releases/tag/v1.1.111) - 2026-05-29
+
+### Changed
+- Updated the Coana CLI to v `15.3.15`.
+
+## [1.1.110](https://github.com/SocketDev/socket-cli/releases/tag/v1.1.110) - 2026-05-29
+
+### Fixed
+- Resolved intermittent ~5-second timeouts affecting manifest uploads for reachability analysis and `socket fix`, along with other long-running API requests. Socket CLI now uses an explicit HTTP agent for all API traffic, so slow uploads and large streaming responses are no longer dropped prematurely.
+
+## [1.1.109](https://github.com/SocketDev/socket-cli/releases/tag/v1.1.109) - 2026-05-28
+
+### Added
+- **`socket fix --exclude-paths`** — Skip matching paths from the scan entirely: manifests under these paths are not uploaded, and fixes are not applied to workspaces under them. Use this to skip directories the current user cannot read (e.g. a postgres `pgdata` directory inside the repo) so they do not abort manifest collection. The pre-existing `--exclude` flag keeps its previous fix-application-only semantic but is now hidden in `--help` in favor of `--exclude-paths`.
+
+## [1.1.108](https://github.com/SocketDev/socket-cli/releases/tag/v1.1.108) - 2026-05-28
+
+### Changed
+- Updated the Coana CLI to v `15.3.12`.
+
+## [1.1.107](https://github.com/SocketDev/socket-cli/releases/tag/v1.1.107) - 2026-05-28
+
+### Changed
+- **`socket manifest gradle --facts [beta]`** (and its `kotlin` alias) gained `--configs` and `--ignore-unresolved`, matching `socket manifest scala --facts`. `--configs` takes comma-separated glob patterns (e.g. `*CompileClasspath,*RuntimeClasspath`) to restrict resolution to matching Gradle configurations; unresolved dependencies are now a fatal error by default — pass `--ignore-unresolved` for the previous lenient behavior.
+- **`socket manifest scala --facts --configs`** now accepts glob patterns too (e.g. `*Test*`) for consistency with the gradle command. Bare names (no `*`/`?`) keep working as exact-name filters, so existing usages are unchanged.
+
+### Fixed
+- **`socket manifest gradle --facts`** now works on Gradle builds with the configuration cache enabled (default on Gradle 9), which previously failed with `Task.project at execution time` errors.
+
+## [1.1.106](https://github.com/SocketDev/socket-cli/releases/tag/v1.1.106) - 2026-05-27
+
+### Added
+- **`socket manifest scala --facts [beta]`** — Emit a `.socket.facts.json` dependency graph from an sbt build for `socket scan create` to consume as a pregenerated SBOM. Toggle also exposed via the `socket manifest setup` wizard for use with `--auto-manifest`.
+
+## [1.1.105](https://github.com/SocketDev/socket-cli/releases/tag/v1.1.105) - 2026-05-27
+
+### Changed
+- Updated the Coana CLI to v `15.3.11`.
+
+## [1.1.104](https://github.com/SocketDev/socket-cli/releases/tag/v1.1.104) - 2026-05-26
+
+### Fixed
+- Coana CLI invocation: strip `npm_package_*` env vars before spawning the npm-install fallback. Prevents `spawn E2BIG` failures in large monorepos where the parent process has hundreds of `npm_package_*` env vars populated from the root `package.json`. Preserves `npm_config_*` (registry / proxy / cache from `.npmrc`).
+
+## [1.1.103](https://github.com/SocketDev/socket-cli/releases/tag/v1.1.103) - 2026-05-26
+
+### Changed
+- Updated the Coana CLI to v `15.3.9`.
+
+## [1.1.102](https://github.com/SocketDev/socket-cli/releases/tag/v1.1.98) - 2026-05-22
+
+### Added
+- **`socket manifest gradle --facts [beta]`** (and its `socket manifest kotlin --facts` alias) — Emit a `.socket.facts.json` dependency graph from a Gradle build for `socket scan create` to consume as a pregenerated SBOM. Toggle also exposed via the `socket manifest setup` wizard for use with `--auto-manifest`.
+
+### Changed
+- Updated the Coana CLI to v `15.3.8`.
+
+## [1.1.101](https://github.com/SocketDev/socket-cli/releases/tag/v1.1.101) - 2026-05-22
+
+### Changed
+- Updated the Coana CLI to v `15.3.6`.
+
+## [1.1.100](https://github.com/SocketDev/socket-cli/releases/tag/v1.1.100) - 2026-05-21
+
+### Changed
+- Updated the Coana CLI to v `15.3.4`.
+
+## [1.1.99](https://github.com/SocketDev/socket-cli/releases/tag/v1.1.99) - 2026-05-20
+
+### Changed
+- Updated the Coana CLI to v `15.3.1`.
+- Forward a `SOCKET_CALLER_USER_AGENT` env var (`socket/<version> node/<nodeVersion> <platform>/<arch>`) to the Coana CLI on spawn. Coana appends this to its outbound axios `User-Agent` so backend traffic identifies the originating Socket CLI alongside the Coana version.
+
+## [1.1.98](https://github.com/SocketDev/socket-cli/releases/tag/v1.1.98) - 2026-05-20
+
+### Changed
+- `socket scan create --reach` now uploads the reachability facts file as brotli on the wire, shrinking mono-repo upload sizes by roughly 85% with no change to the on-disk or stored format. Faster scan submissions on slow connections.
+
+## [1.1.97](https://github.com/SocketDev/socket-cli/releases/tag/v1.1.97) - 2026-05-18
+
+### Changed
+- Updated the Coana CLI to v `15.3.0`.
+
+## [1.1.96](https://github.com/SocketDev/socket-cli/releases/tag/v1.1.96) - 2026-05-15
+
+### Changed
+- Updated the Coana CLI to v `15.2.8`.
+
 ## [1.1.95](https://github.com/SocketDev/socket-cli/releases/tag/v1.1.95) - 2026-05-15
 
 ### Changed
